@@ -1,0 +1,69 @@
+;; tars_codex_sandbox.sb
+;; Optional sandbox profile for autonomous Codex CLI builds.
+;; Active only when TARS_CODEX_SANDBOX=1 is set in the env.
+;;
+;; Philosophy: full Codex access is the default for this project. This profile
+;; remains available as an explicit opt-in guard.
+;;
+;; Allows:
+;;   - Read everywhere
+;;   - Write inside: workshop dir (passed in via -D WORKSHOP_DIR=...),
+;;                   ~/.cache, ~/Library/Caches, /tmp, /opt/homebrew,
+;;                   /var/folders (Homebrew + macOS tempdirs)
+;;   - Network outbound
+;;   - Process exec, IPC, etc.
+;; Denies:
+;;   - Write to user's home dir (except the cache subdirs above)
+;;   - Write to /etc, /usr, /Library, /Applications, /System
+;;
+;; sandbox-exec is deprecated on macOS but still works (12+, 13+, 14+, 15+).
+;; You'll see a deprecation warning on stderr; ignore it.
+
+(version 1)
+(allow default)
+
+;; ── Filesystem reads: allow all ─────────────────────────────────────────
+(allow file-read*)
+
+;; ── Filesystem writes: deny by default, then re-allow specific paths ──
+(deny file-write*)
+
+;; Workshop dir is always writable (the build directory itself)
+(allow file-write*
+  (subpath (param "WORKSHOP_DIR")))
+
+;; Standard cache locations
+(allow file-write*
+  (subpath (string-append (param "HOME") "/.cache"))
+  (subpath (string-append (param "HOME") "/Library/Caches"))
+  (subpath (string-append (param "HOME") "/Library/Logs"))
+  (subpath (string-append (param "HOME") "/Library/Application Support/Codex"))
+  (subpath (string-append (param "HOME") "/.codex"))
+  (subpath (string-append (param "HOME") "/.config"))
+  (subpath (string-append (param "HOME") "/.local"))
+  (subpath (string-append (param "HOME") "/.npm"))
+  (subpath (string-append (param "HOME") "/.cargo"))
+  (subpath (string-append (param "HOME") "/.rustup"))
+  (subpath (string-append (param "HOME") "/.pyenv")))
+
+;; Temp dirs
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/var/folders"))
+(allow file-write* (subpath "/private/var/folders"))
+
+;; Homebrew
+(allow file-write* (subpath "/opt/homebrew"))
+(allow file-write* (subpath "/usr/local/Caskroom"))
+(allow file-write* (subpath "/usr/local/Cellar"))
+
+;; ── Hard-deny a few sensitive areas (defense in depth) ────────────────
+(deny file-write*
+  (subpath "/System")
+  (subpath "/Applications")
+  (subpath (string-append (param "HOME") "/Documents"))
+  (subpath (string-append (param "HOME") "/Desktop"))
+  (subpath (string-append (param "HOME") "/.ssh"))
+  (subpath (string-append (param "HOME") "/.aws"))
+  (subpath (string-append (param "HOME") "/Library/Mail"))
+  (subpath (string-append (param "HOME") "/Library/Messages")))

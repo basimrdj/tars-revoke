@@ -1,0 +1,9 @@
+{
+  "inner_fast": {
+    "provider": "mlx",
+    "model": "mlx-community/gemma-4-e4b-it-4bit",
+    "endpoint": "http://127.0.0.1:8765/v1/chat/completions",
+    "description": "background cognition (continuous thoughts) using cached Gemma 4 E4B MLX 4-bit",
+    "enabled": true
+  }
+}

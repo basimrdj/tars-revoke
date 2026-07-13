@@ -1,0 +1,66 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*secret*
+*token*
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+# Local virtualenvs and model/runtime caches
+.venv/
+venv/
+tars_vibevoice/venv/
+tars_audio_cache/
+.cache/
+models/
+
+# Runtime state: logs, memory, metrics, generated build jobs
+.tars_assistant.lock
+tars_*.jsonl
+tars_memory.json
+tars_memory.db
+tars_memory.db-*
+tars_learnings.json
+tars_budget.json
+tars_cron.json
+tars_desires.json
+tars_emotion.json
+tars_concerns.json
+tars_user_state.json
+tars_working_memory.json
+tars_world_state.json
+tars_self_model.json
+tars_soul_history/
+tars_workshop/
+scratch/
+*.log
+
+# Generated or locally downloaded binaries/assets
+AppleSTT.app/
+file_stt
+stt_test
+tars_stt_cli
+tars_vibevoice/voices/*.pt
+*.wav
+*.mp3
+*.m4a
+*.aiff
+*.flac
+
+# Generated prompt/debug dumps
+test_prompt_dump.txt
+*_prompt_dump.txt
