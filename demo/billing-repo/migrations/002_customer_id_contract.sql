@@ -1,0 +1,1 @@
+-- No customer ID contract migration is authorized in the baseline.

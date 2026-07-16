@@ -1,0 +1,98 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tars-revoke"
+version = "0.1.0"
+description = "Continuous, evidence-backed authorization for coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Basim Hussain" }]
+dependencies = [
+  "cryptography>=48.0.1,<49",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.5,<2",
+  "hypothesis>=6.124,<7",
+  "mypy>=1.14,<2",
+  "pip-audit>=2.10,<3",
+  "pytest>=9.0.3,<10",
+  "pytest-asyncio>=1.4,<2",
+  "pytest-cov>=6,<7",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+tars-revoke = "tars_revoke.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tars_revoke"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/tars_revoke/persistence/schema.sql" = "tars_revoke/persistence/schema.sql"
+"demo/billing-repo" = "tars_revoke/demo/fixture_template"
+"web/dist" = "tars_revoke/web_dist"
+
+[tool.hatch.build]
+ignore-vcs = true
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+  "src",
+  "demo/billing-repo",
+  "docs/revoke",
+  "tests",
+  "tools",
+  "web",
+  "README.md",
+  "SECURITY.md",
+  "LICENSE",
+  "Makefile",
+  "pyproject.toml",
+  "uv.lock",
+  ".env.example",
+]
+exclude = [
+  "/web/node_modules",
+  "/web/design",
+  "/web/.vite",
+  "/web/*.tsbuildinfo",
+  "/**/__pycache__",
+  "/.tars",
+  "/artifacts",
+  "/worktrees",
+  "/remotes",
+  "/quarantine",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "live: requires a live Codex session",
+  "slow: exercises randomized schedules or process restarts",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+packages = ["tars_revoke"]

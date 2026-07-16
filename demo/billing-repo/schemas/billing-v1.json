@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tars-demo:billing:customer:v1",
+  "title": "Billing customer v1",
+  "type": "object",
+  "required": ["customer_id", "email"],
+  "properties": {
+    "customer_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "email": {
+      "type": "string",
+      "format": "email"
+    }
+  },
+  "additionalProperties": false
+}

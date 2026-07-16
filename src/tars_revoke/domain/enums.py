@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+from enum import Enum
+
+
+class StrEnum(str, Enum):
+    """Python 3.10-compatible string enum."""
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+class RunState(StrEnum):
+    DECLARED = "DECLARED"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class AgentState(StrEnum):
+    DECLARED = "DECLARED"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class SessionState(StrEnum):
+    DECLARED = "DECLARED"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class SignatureStatus(StrEnum):
+    MISSING = "MISSING"
+    VALID = "VALID"
+    INVALID = "INVALID"
+
+
+class VerificationStatus(StrEnum):
+    PENDING = "PENDING"
+    VERIFIED = "VERIFIED"
+    REJECTED = "REJECTED"
+
+
+class EvidenceRole(StrEnum):
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    INVALIDATES = "INVALIDATES"
+
+
+class ValueSemantics(StrEnum):
+    SINGLE = "SINGLE"
+    SET = "SET"
+    TEMPORAL = "TEMPORAL"
+
+
+class PremiseState(StrEnum):
+    PROPOSED = "PROPOSED"
+    ACTIVE = "ACTIVE"
+    DISPUTED = "DISPUTED"
+    INVALIDATED = "INVALIDATED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class NodeKind(StrEnum):
+    EVIDENCE = "EVIDENCE"
+    PREMISE = "PREMISE"
+    WARRANT = "WARRANT"
+    ACTION = "ACTION"
+    EFFECT = "EFFECT"
+    EXPERIMENT = "EXPERIMENT"
+    TEST = "TEST"
+    RECEIPT = "RECEIPT"
+
+
+class EdgeType(StrEnum):
+    REQUIRES = "REQUIRES"
+    SUPPORTS = "SUPPORTS"
+    PRODUCED_BY = "PRODUCED_BY"
+    MATERIALIZES = "MATERIALIZES"
+    REPLACES = "REPLACES"
+    VERIFIES = "VERIFIES"
+
+
+class EdgeStrength(StrEnum):
+    HARD = "HARD"
+    SOFT = "SOFT"
+
+
+class RiskLevel(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
+class Reversibility(StrEnum):
+    REVERSIBLE = "REVERSIBLE"
+    IRREVERSIBLE = "IRREVERSIBLE"
+    CONDITIONAL = "CONDITIONAL"
+
+
+class WarrantState(StrEnum):
+    DECLARED = "DECLARED"
+    PREPARED = "PREPARED"
+    AUTHORIZED = "AUTHORIZED"
+    REVOKE_PENDING = "REVOKE_PENDING"
+    REVOKED = "REVOKED"
+    EXPIRED = "EXPIRED"
+
+
+class ActionType(StrEnum):
+    FILE_EDIT = "FILE_EDIT"
+    LOCAL_COMMIT = "LOCAL_COMMIT"
+    COMMAND = "COMMAND"
+    DATABASE_MIGRATION = "DATABASE_MIGRATION"
+    PUSH = "PUSH"
+    EXTERNAL = "EXTERNAL"
+    EXPERIMENT = "EXPERIMENT"
+    TEST = "TEST"
+    REPAIR = "REPAIR"
+
+
+class ActionState(StrEnum):
+    DECLARED = "DECLARED"
+    PREPARED = "PREPARED"
+    AUTHORIZED = "AUTHORIZED"
+    DISPATCHING = "DISPATCHING"
+    EXECUTED = "EXECUTED"
+    REVOKE_PENDING = "REVOKE_PENDING"
+    REVOKED = "REVOKED"
+    ROLLED_BACK = "ROLLED_BACK"
+    QUARANTINED = "QUARANTINED"
+    CONTAINMENT_REQUIRED = "CONTAINMENT_REQUIRED"
+    FAILED = "FAILED"
+
+
+class EffectType(StrEnum):
+    FILE_EDIT = "FILE_EDIT"
+    LOCAL_COMMIT = "LOCAL_COMMIT"
+    COMMAND = "COMMAND"
+    DATABASE_MIGRATION = "DATABASE_MIGRATION"
+    PUSH = "PUSH"
+    EXTERNAL = "EXTERNAL"
+
+
+class EffectState(StrEnum):
+    DECLARED = "DECLARED"
+    PREPARED = "PREPARED"
+    AUTHORIZED = "AUTHORIZED"
+    DISPATCHING = "DISPATCHING"
+    EXECUTED = "EXECUTED"
+    REVOKE_PENDING = "REVOKE_PENDING"
+    REVOKED = "REVOKED"
+    ROLLED_BACK = "ROLLED_BACK"
+    QUARANTINED = "QUARANTINED"
+    CONTAINMENT_REQUIRED = "CONTAINMENT_REQUIRED"
+    FAILED = "FAILED"
+
+
+class DispatchReconciliationOutcome(StrEnum):
+    APPLIED = "APPLIED"
+    NOT_APPLIED = "NOT_APPLIED"
+    CONFLICT = "CONFLICT"
+    UNKNOWN = "UNKNOWN"
+
+
+class LeaseState(StrEnum):
+    ACTIVE = "ACTIVE"
+    CONSUMED = "CONSUMED"
+    REVOKED = "REVOKED"
+    EXPIRED = "EXPIRED"
+
+
+class RevocationCaseState(StrEnum):
+    OPEN = "OPEN"
+    FROZEN = "FROZEN"
+    INVENTORIED = "INVENTORIED"
+    COMPENSATING = "COMPENSATING"
+    EXPERIMENTING = "EXPERIMENTING"
+    REPAIRING = "REPAIRING"
+    VERIFYING = "VERIFYING"
+    RESUMED = "RESUMED"
+    ATTESTED = "ATTESTED"
+    CLOSED = "CLOSED"
+    ESCALATED = "ESCALATED"
+
+
+class RevocationMemberKind(StrEnum):
+    WARRANT = "WARRANT"
+    ACTION = "ACTION"
+    EFFECT = "EFFECT"
+    EXPERIMENT = "EXPERIMENT"
+    TEST = "TEST"
+
+
+class ExperimentState(StrEnum):
+    PROPOSED = "PROPOSED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    SELECTED = "SELECTED"
+    RUNNING = "RUNNING"
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+
+
+class TestKind(StrEnum):
+    TARGETED = "TARGETED"
+    FULL = "FULL"
+    PREFLIGHT = "PREFLIGHT"
+    REGRESSION = "REGRESSION"
+
+
+class TestState(StrEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+    ERROR = "ERROR"
+    CANCELLED = "CANCELLED"
+
+
+class ReceiptState(StrEnum):
+    DRAFT = "DRAFT"
+    FINAL = "FINAL"
+    VERIFIED = "VERIFIED"
+    INVALID = "INVALID"
+
+
+class OutboxState(StrEnum):
+    PENDING = "PENDING"
+    CLAIMED = "CLAIMED"
+    PUBLISHED = "PUBLISHED"
+    FAILED = "FAILED"
+    DEAD = "DEAD"
