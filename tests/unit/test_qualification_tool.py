@@ -38,6 +38,15 @@ def test_qualification_and_verifier_share_the_pinned_codex_catalog() -> None:
     assert _tool()._PINNED_CODEX_RELEASES == VERIFIER_CODEX_RELEASES
 
 
+def test_clean_clone_setup_builds_forced_frontend_before_editable_install() -> None:
+    makefile = (Path(__file__).parents[2] / "Makefile").read_text(encoding="utf-8")
+    setup = makefile.split("setup:\n", maxsplit=1)[1].split("\nlint:\n", maxsplit=1)[0]
+
+    assert setup.index("$(MAKE) web-install web-build") < setup.index(
+        ".venv/bin/python -m pip install -e '.[dev]'"
+    )
+
+
 def test_source_manifest_is_bound_to_git_blob_bytes(tmp_path: Path) -> None:
     tool = _tool()
     repository = tmp_path / "source"

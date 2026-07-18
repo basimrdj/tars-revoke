@@ -5,8 +5,8 @@
 setup:
 	python3 -m venv .venv
 	.venv/bin/python -m pip install --upgrade pip setuptools wheel
-	.venv/bin/python -m pip install -e '.[dev]'
 	$(MAKE) web-install web-build
+	.venv/bin/python -m pip install -e '.[dev]'
 
 lint:
 	.venv/bin/ruff check src tests tools
