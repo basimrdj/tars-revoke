@@ -70,6 +70,9 @@ _CODEX_BUNDLE_IDENTIFIER = "com.openai.codex"
 _CODEX_TEAM_IDENTIFIER = "2DC432GLL2"
 _CODEX_BUNDLE_NAMES = {"ChatGPT.app", "Codex.app"}
 _PINNED_CODEX_RELEASES = {
+    "codex-cli 0.145.0-alpha.18": (
+        "a2bc3f63b0d7ce5c065ae070e16d964fa71192bf6ceb8da82d2315227d55a6bf"
+    ),
     "codex-cli 0.144.5": "bdcb530615d44fcc7b35d12fe00f30c3025c25fc22a21193591dcdb064304385",
 }
 

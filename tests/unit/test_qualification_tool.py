@@ -11,6 +11,8 @@ from types import ModuleType
 
 import pytest
 
+from tars_revoke.demo.release_proofs import _PINNED_CODEX_RELEASES as VERIFIER_CODEX_RELEASES
+
 
 def _tool() -> ModuleType:
     path = Path(__file__).parents[2] / "tools" / "qualify_release.py"
@@ -30,6 +32,10 @@ def _git(repository: Path, *args: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def test_qualification_and_verifier_share_the_pinned_codex_catalog() -> None:
+    assert _tool()._PINNED_CODEX_RELEASES == VERIFIER_CODEX_RELEASES
 
 
 def test_source_manifest_is_bound_to_git_blob_bytes(tmp_path: Path) -> None:
