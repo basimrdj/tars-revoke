@@ -12,8 +12,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
+from tars_revoke.adapters._safety import is_python_executable
+from tars_revoke.adapters.codex import CodexProtocolError
+from tars_revoke.demo.live_codex import validate_live_experiment_proposal
 from tars_revoke.domain.canonical import canonical_digest, sha256_digest
 from tars_revoke.domain.enums import (
     ActionState,
@@ -62,6 +65,48 @@ _SETUP_ARGV = {
     "build": ("make", "build"),
     "release-check": ("make", "release-check"),
 }
+QUALIFICATION_INHERITED_ENVIRONMENT_KEYS = (
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+)
+QUALIFICATION_LIVE_ONLY_ENVIRONMENT_KEYS = (
+    "CODEX_API_KEY",
+    "CODEX_HOME",
+    "HOME",
+    "OPENAI_API_KEY",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT",
+    "OPENAI_PROJECT_ID",
+)
+QUALIFICATION_FIXED_ENVIRONMENT = {
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_CACHE_DIR": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONHASHSEED": "0",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "UV_NO_CACHE": "1",
+}
+QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS = (
+    "CONDA_PREFIX",
+    "OPENAI_BASE_URL",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "TARS_CODEX_MODEL",
+    "TARS_RUN_LIVE_CODEX",
+    "VIRTUAL_ENV",
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -157,6 +202,10 @@ class QualificationJournalProof:
     receipt_file_digests: tuple[str, str, str]
     tars_revoke_executable: str
     tars_revoke_executable_sha256: str
+    python_invocation_path: str
+    python_resolved_path: str
+    python_executable_sha256: str
+    python_runtime_inventory_digest: str
     codex_executable: str
     codex_executable_sha256: str
     codex_executable_version: str
@@ -251,6 +300,7 @@ def verify_live_codex_repair(
     _verify_live_proposal_attempts(
         root,
         receipt,
+        manifest=manifest,
         analysis_thread=str(analysis["thread_id"]),
         experiment_sessions=experiments,
     )
@@ -293,6 +343,7 @@ def _verify_live_proposal_attempts(
     root: Path,
     receipt: Mapping[str, Any],
     *,
+    manifest: Mapping[str, Any],
     analysis_thread: str,
     experiment_sessions: Sequence[Mapping[str, Any]],
 ) -> None:
@@ -339,8 +390,12 @@ def _verify_live_proposal_attempts(
             raise IntegrityError("R-14 proposal attempt did not resume Agent B's thread")
         bindings = (
             ("manifest_path", "manifest_digest", "manifest_path"),
-            ("events_path", "events_sha256", None),
-            ("event_observations_path", "event_observations_sha256", None),
+            ("events_path", "events_sha256", "events_path"),
+            (
+                "event_observations_path",
+                "event_observations_sha256",
+                "event_observations_path",
+            ),
         )
         for path_key, digest_key, session_key in bindings:
             path = _artifact_reference(root, attempt.get(path_key), label=path_key)
@@ -355,15 +410,137 @@ def _verify_live_proposal_attempts(
                 raise IntegrityError("R-14 proposal manifest path differs from its session")
         error = attempt.get("validation_error")
         is_final = index == len(attempts) - 1
-        if is_final and error is not None:
-            raise IntegrityError("R-14 final successful proposal still has a validation error")
-        if not is_final and (not isinstance(error, str) or not error):
-            raise IntegrityError("R-14 correction attempt lacks its triggering validation error")
-        if isinstance(error, str):
-            validation_errors.append(error)
+        last_message = _artifact_reference(
+            root,
+            session.get("last_message_path"),
+            label="proposal last message",
+        )
+        raw_proposal = _load_object(last_message)
+        try:
+            validate_live_experiment_proposal(raw_proposal)
+        except CodexProtocolError as exc:
+            recomputed_error = str(exc)
+            if is_final:
+                raise IntegrityError("R-14 final proposal fails deterministic validation") from exc
+            if error != recomputed_error:
+                raise IntegrityError(
+                    "R-14 proposal validation error differs from deterministic replay"
+                ) from exc
+            validation_errors.append(recomputed_error)
+        else:
+            if not is_final:
+                raise IntegrityError("R-14 correction was requested for a valid proposal")
+            if error is not None:
+                raise IntegrityError(
+                    "R-14 final successful proposal still has a validation error"
+                )
     claimed_errors = experiment.get("live_proposal_validation_errors")
     if claimed_errors != validation_errors:
         raise IntegrityError("R-14 proposal validation errors differ from attempt evidence")
+    _verify_live_candidate_lineage(
+        root,
+        manifest,
+        experiment=experiment,
+        final_session=experiment_sessions[-1],
+    )
+
+
+def _verify_live_candidate_lineage(
+    root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    experiment: Mapping[str, Any],
+    final_session: Mapping[str, Any],
+) -> None:
+    last_message = _artifact_reference(
+        root,
+        final_session.get("last_message_path"),
+        label="final experiment proposal",
+    )
+    proposal = _load_object(last_message)
+    try:
+        validated_candidates = validate_live_experiment_proposal(proposal)
+    except CodexProtocolError as exc:
+        raise IntegrityError("R-14 final Codex proposal fails the runtime policy") from exc
+    proposed_rows = proposal.get("candidates")
+    if not isinstance(proposed_rows, list) or len(proposed_rows) < 3 or any(
+        not isinstance(row, Mapping) for row in proposed_rows
+    ):
+        raise IntegrityError("R-14 final Codex proposal has malformed candidates")
+    if proposed_rows != [candidate.as_mapping() for candidate in validated_candidates]:
+        raise IntegrityError("R-14 final Codex proposal changed during runtime validation")
+    candidate_paths = [
+        path for path in requirement_paths(root, manifest, "R-12") if path.name == "candidates.json"
+    ]
+    if len(candidate_paths) != 1:
+        raise IntegrityError("R-14 requires one R-12 candidate proof")
+    candidate_proof = _load_object(candidate_paths[0])
+    durable_rows = candidate_proof.get("candidates")
+    if not isinstance(durable_rows, list) or any(
+        not isinstance(row, Mapping) for row in durable_rows
+    ):
+        raise IntegrityError("R-14 durable candidate proof is malformed")
+    durable_by_id = {str(row.get("id", "")): row for row in durable_rows}
+    proposed_ids = [str(row.get("id", "")) for row in proposed_rows]
+    if (
+        len(proposed_ids) != len(set(proposed_ids))
+        or not all(proposed_ids)
+        or set(proposed_ids) != set(durable_by_id)
+    ):
+        raise IntegrityError("R-14 Codex candidates differ from R-12 durable candidates")
+    expected_fields = {
+        "id",
+        "hypotheses",
+        "predictions",
+        "argv",
+        "touched_files",
+        "risk",
+        "estimated_runtime_ms",
+        "command_count",
+    }
+    for proposed in proposed_rows:
+        if set(proposed) != expected_fields:
+            raise IntegrityError("R-14 Codex candidate has unexpected fields")
+        durable = durable_by_id[str(proposed.get("id"))]
+        metadata = durable.get("metadata")
+        proposed_argv = proposed.get("argv")
+        execution_argv = durable.get("argv")
+        resolution = (
+            metadata.get("executable_resolution") if isinstance(metadata, Mapping) else None
+        )
+        if (
+            not isinstance(proposed_argv, list)
+            or not proposed_argv
+            or any(not isinstance(item, str) or not item for item in proposed_argv)
+            or not isinstance(execution_argv, list)
+            or not execution_argv
+            or any(not isinstance(item, str) or not item for item in execution_argv)
+            or not Path(execution_argv[0]).is_absolute()
+            or not is_python_executable(execution_argv[0])
+            or execution_argv[1:] != proposed_argv[1:]
+            or not isinstance(metadata, Mapping)
+            or metadata.get("proposed_by") != "live-codex"
+            or metadata.get("proposed_argv") != proposed_argv
+            or not isinstance(resolution, Mapping)
+            or resolution.get("kind") != "scenario-python-runtime"
+            or resolution.get("resolved_path") != execution_argv[0]
+        ):
+            raise IntegrityError("R-14 Codex candidate executable resolution is inconsistent")
+        comparable = {
+            "id": durable.get("id"),
+            "hypotheses": durable.get("hypotheses"),
+            "predictions": durable.get("predictions"),
+            "argv": proposed_argv,
+            "touched_files": durable.get("touched_files"),
+            "risk": str(durable.get("risk", "")).lower(),
+            "estimated_runtime_ms": durable.get("estimated_runtime_ms"),
+            "command_count": durable.get("command_count"),
+        }
+        if dict(proposed) != comparable:
+            raise IntegrityError("R-14 Codex candidate content changed before selection")
+    selected_id = candidate_proof.get("selected_candidate_id")
+    if selected_id not in proposed_ids or experiment.get("selected_candidate_id") != selected_id:
+        raise IntegrityError("R-14 selected experiment did not come from Codex")
 
 
 def _artifact_reference(root: Path, value: object, *, label: str) -> Path:
@@ -394,6 +571,8 @@ def _verify_live_session(root: Path, manifest_path: Path) -> dict[str, Any]:
         "worktree",
         "before_head",
         "after_head",
+        "before_workspace_digest",
+        "after_workspace_digest",
     ):
         if not isinstance(payload.get(field), str) or not payload[field]:
             raise IntegrityError(f"R-14 live session is missing {field}")
@@ -417,6 +596,7 @@ def _verify_live_session(root: Path, manifest_path: Path) -> dict[str, Any]:
         raise IntegrityError("R-14 session file manifest is missing")
     required_files = {
         "changed-paths.json",
+        "event-observations.jsonl",
         "events.jsonl",
         "last-message.txt",
         "stderr.log",
@@ -459,6 +639,17 @@ def _verify_live_session(root: Path, manifest_path: Path) -> dict[str, Any]:
     manifest_items = _string_sequence(payload.get("item_ids"), "Codex item IDs")
     if item_ids != manifest_items:
         raise IntegrityError("R-14 item lineage differs from raw Codex JSONL")
+    agent_messages = [
+        str(item["item"]["text"])
+        for item in events
+        if item.get("type") == "item.completed"
+        and isinstance(item.get("item"), Mapping)
+        and item["item"].get("type") == "agent_message"
+        and isinstance(item["item"].get("text"), str)
+    ]
+    last_message_path = session_root / "last-message.txt"
+    if not agent_messages or last_message_path.read_text(encoding="utf-8") != agent_messages[-1]:
+        raise IntegrityError("R-14 last message differs from raw Codex JSONL")
 
     diff_text = (session_root / "workspace.diff").read_text(encoding="utf-8")
     diff_paths = tuple(match[0] for match in _DIFF_RE.findall(diff_text) if match[0] == match[1])
@@ -466,6 +657,13 @@ def _verify_live_session(root: Path, manifest_path: Path) -> dict[str, Any]:
         raise IntegrityError("R-14 workspace diff differs from changed-paths evidence")
     if not changed_paths and diff_text:
         raise IntegrityError("R-14 session claims no changes but has a workspace diff")
+    if read_only_stage and (
+        changed_paths
+        or diff_text
+        or payload["before_head"] != payload["after_head"]
+        or payload["before_workspace_digest"] != payload["after_workspace_digest"]
+    ):
+        raise IntegrityError("R-14 read-only Codex session changed its workspace")
 
     schema_digest = payload.get("output_schema_digest")
     if not isinstance(schema_digest, str) or not _SHA256_RE.fullmatch(schema_digest):
@@ -484,12 +682,19 @@ def _verify_live_session(root: Path, manifest_path: Path) -> dict[str, Any]:
         "changed_paths": list(changed_paths),
         "item_ids": list(item_ids),
         "manifest_path": manifest_path.relative_to(root).as_posix(),
+        "last_message_path": last_message_path.relative_to(root).as_posix(),
+        "events_path": (session_root / "events.jsonl").relative_to(root).as_posix(),
+        "event_observations_path": (
+            session_root / "event-observations.jsonl"
+        ).relative_to(root).as_posix(),
         "executable": payload["executable"],
         "executable_version": payload["executable_version"],
         "executable_sha256": payload["executable_sha256"],
         "worktree": payload["worktree"],
         "before_head": payload["before_head"],
         "after_head": payload["after_head"],
+        "before_workspace_digest": payload["before_workspace_digest"],
+        "after_workspace_digest": payload["after_workspace_digest"],
     }
 
 
@@ -1903,6 +2108,382 @@ def _benchmark_transitions(
     return records
 
 
+def _verify_qualification_environment_policy(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "protocol",
+        "inherited_allowlist",
+        "present_inherited_keys",
+        "live_only_allowlist",
+        "live_present_keys",
+        "fixed_values",
+        "gate_injected_keys",
+        "runtime_injected_keys",
+        "forbidden_keys",
+        "auth_key_names_present",
+        "non_live_auth_keys_present",
+        "live_auth_sources",
+        "gate_home_sha256",
+        "path_sha256",
+    }:
+        raise IntegrityError("R-20 qualification environment policy is missing or unsafe")
+    inherited = value.get("inherited_allowlist")
+    present = value.get("present_inherited_keys")
+    live_allowlist = value.get("live_only_allowlist")
+    live_present = value.get("live_present_keys")
+    auth = value.get("auth_key_names_present")
+    non_live_auth = value.get("non_live_auth_keys_present")
+    auth_sources = value.get("live_auth_sources")
+    string_lists = (present, live_present, auth, non_live_auth, auth_sources)
+    if any(
+        not isinstance(items, list)
+        or any(not isinstance(item, str) for item in items)
+        for items in string_lists
+    ):
+        raise IntegrityError("R-20 qualification environment policy is missing or unsafe")
+    present_values = cast(list[str], present)
+    live_present_values = cast(list[str], live_present)
+    auth_values = cast(list[str], auth)
+    non_live_auth_values = cast(list[str], non_live_auth)
+    auth_source_values = cast(list[str], auth_sources)
+    if (
+        value.get("protocol") != "tars.qualification-environment/v3"
+        or inherited != list(QUALIFICATION_INHERITED_ENVIRONMENT_KEYS)
+        or live_allowlist != list(QUALIFICATION_LIVE_ONLY_ENVIRONMENT_KEYS)
+        or value.get("fixed_values") != QUALIFICATION_FIXED_ENVIRONMENT
+        or value.get("gate_injected_keys") != ["HOME"]
+        or value.get("runtime_injected_keys") != ["TARS_CODEX_BIN"]
+        or value.get("forbidden_keys") != list(QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS)
+        or present_values != sorted(set(present_values))
+        or any(
+            item not in QUALIFICATION_INHERITED_ENVIRONMENT_KEYS
+            for item in present_values
+        )
+        or live_present_values != sorted(set(live_present_values))
+        or any(
+            item not in QUALIFICATION_LIVE_ONLY_ENVIRONMENT_KEYS
+            for item in live_present_values
+        )
+        or auth_values != sorted(set(auth_values))
+        or any(item not in {"CODEX_API_KEY", "OPENAI_API_KEY"} for item in auth_values)
+        or any(item not in live_present_values for item in auth_values)
+        or non_live_auth_values != []
+        or not auth_source_values
+        or auth_source_values != sorted(set(auth_source_values))
+        or any(
+            item not in {"CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME"}
+            for item in auth_source_values
+        )
+        or any(item not in live_present_values for item in auth_source_values)
+        or not isinstance(value.get("gate_home_sha256"), str)
+        or not _SHA256_RE.fullmatch(str(value.get("gate_home_sha256")))
+        or not isinstance(value.get("path_sha256"), str)
+        or not _SHA256_RE.fullmatch(str(value.get("path_sha256")))
+        or set(present_values) & set(QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS)
+        or set(QUALIFICATION_FIXED_ENVIRONMENT) & set(QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS)
+    ):
+        raise IntegrityError("R-20 qualification environment policy is missing or unsafe")
+
+
+def _verify_python_runtime_record(
+    root: Path,
+    source: Mapping[str, Any],
+    *,
+    workspace_root: Path,
+    source_files: Mapping[str, Mapping[str, Any]],
+    entrypoint_bytes: bytes,
+) -> Mapping[str, str]:
+    runtime_path = _safe_file(
+        root,
+        source.get("python_runtime_path"),
+        label="Python runtime provenance",
+    )
+    if source.get("python_runtime_sha256") != sha256_digest(runtime_path.read_bytes()):
+        raise IntegrityError("R-20 Python runtime provenance digest changed")
+    executable = _safe_file(
+        root,
+        source.get("python_executable_evidence_path"),
+        label="qualified Python executable",
+    )
+    executable_digest = sha256_digest(executable.read_bytes())
+    if source.get("python_executable_sha256") != executable_digest:
+        raise IntegrityError("R-20 qualified Python executable digest changed")
+    inventory_path = _safe_file(
+        root,
+        source.get("python_runtime_inventory_path"),
+        label="Python runtime inventory",
+    )
+    if source.get("python_runtime_inventory_sha256") != sha256_digest(
+        inventory_path.read_bytes()
+    ):
+        raise IntegrityError("R-20 Python runtime inventory bytes changed")
+    inventory = _load_object(inventory_path)
+    inventory_digest = inventory.get("canonical_digest")
+    unsigned_inventory = dict(inventory)
+    unsigned_inventory.pop("canonical_digest", None)
+    if (
+        inventory.get("protocol") != "tars.python-runtime-inventory/v1"
+        or inventory_digest != canonical_digest(unsigned_inventory)
+        or source.get("python_runtime_inventory_digest") != inventory_digest
+        or not isinstance(inventory.get("roots"), list)
+        or not isinstance(inventory.get("entries"), list)
+    ):
+        raise IntegrityError("R-20 Python runtime inventory is malformed")
+    inventory_entries = inventory["entries"]
+    if any(not isinstance(entry, Mapping) for entry in inventory_entries):
+        raise IntegrityError("R-20 Python runtime inventory entries are malformed")
+    inventory_by_path = {
+        str(entry.get("path", "")): entry for entry in inventory_entries
+    }
+    if len(inventory_by_path) != len(inventory_entries) or not all(inventory_by_path):
+        raise IntegrityError("R-20 Python runtime inventory repeats a path")
+    payload = _load_object(runtime_path)
+    expected_fields = {
+        "protocol",
+        "sys_executable",
+        "sys_prefix",
+        "sys_base_prefix",
+        "python_version",
+        "site_packages",
+        "stdlib_path",
+        "sys_path",
+        "package_file",
+        "package_file_sha256",
+        "distribution_name",
+        "distribution_version",
+        "distribution_direct_url",
+        "distribution_entry_points",
+        "loaded_modules",
+        "distributions",
+        "entrypoint_path",
+        "entrypoint_sha256",
+        "entrypoint_format",
+        "python_invocation_path",
+        "resolved_executable",
+        "resolved_executable_sha256",
+        "runtime_inventory_path",
+        "runtime_inventory_digest",
+    }
+    if set(payload) != expected_fields or payload.get("protocol") != "tars.python-runtime/v1":
+        raise IntegrityError("R-20 Python runtime provenance is malformed")
+    venv = workspace_root / ".venv"
+    invocation = _required_text(
+        payload.get("python_invocation_path"),
+        "Python invocation path",
+    )
+    sys_executable = _required_text(payload.get("sys_executable"), "Python sys.executable")
+    resolved_executable = _required_text(
+        payload.get("resolved_executable"),
+        "Python executable",
+    )
+    if (
+        not Path(invocation).is_absolute()
+        or Path(invocation) != venv / "bin" / "python"
+        or source.get("python_invocation_path") != invocation
+        or source.get("python_resolved_path") != resolved_executable
+        or sys_executable != invocation
+        or payload.get("sys_prefix") != str(venv)
+        or payload.get("entrypoint_path") != source.get("tars_revoke_installed_entrypoint")
+        or payload.get("entrypoint_sha256") != sha256_digest(entrypoint_bytes)
+        or payload.get("entrypoint_format") not in {"direct-shebang", "pip-trampoline"}
+        or payload.get("distribution_entry_points")
+        != [
+            {
+                "group": "console_scripts",
+                "name": "tars-revoke",
+                "value": "tars_revoke.cli:app",
+            }
+        ]
+        or payload.get("resolved_executable_sha256") != executable_digest
+        or payload.get("runtime_inventory_path")
+        != source.get("python_runtime_inventory_path")
+        or payload.get("runtime_inventory_digest") != inventory_digest
+        or not Path(resolved_executable).is_absolute()
+        or not isinstance(payload.get("python_version"), str)
+        or not str(payload.get("python_version"))
+    ):
+        raise IntegrityError("R-20 tars-revoke entry point is not bound to its Python runtime")
+    invocation_entry = inventory_by_path.get(invocation)
+    resolved_entry = inventory_by_path.get(resolved_executable)
+    entrypoint_entry = inventory_by_path.get(
+        str(source.get("tars_revoke_installed_entrypoint"))
+    )
+    if (
+        not isinstance(invocation_entry, Mapping)
+        or invocation_entry.get("kind") != "symlink"
+        or not isinstance(resolved_entry, Mapping)
+        or resolved_entry.get("kind") != "file"
+        or resolved_entry.get("sha256") != executable_digest
+        or not isinstance(entrypoint_entry, Mapping)
+        or entrypoint_entry.get("kind") != "file"
+        or entrypoint_entry.get("sha256") != sha256_digest(entrypoint_bytes)
+    ):
+        raise IntegrityError("R-20 runtime inventory omits the launcher or entry point")
+    expected_package = workspace_root / "src" / "tars_revoke" / "__init__.py"
+    package_source = source_files.get("src/tars_revoke/__init__.py")
+    if (
+        payload.get("package_file") != str(expected_package)
+        or not isinstance(package_source, Mapping)
+        or payload.get("package_file_sha256") != package_source.get("sha256")
+        or payload.get("distribution_name") != "tars-revoke"
+        or not isinstance(payload.get("distribution_version"), str)
+        or not payload.get("distribution_version")
+    ):
+        raise IntegrityError("R-20 imported tars-revoke package differs from the source commit")
+    direct_url_raw = payload.get("distribution_direct_url")
+    try:
+        direct_url = json.loads(direct_url_raw) if isinstance(direct_url_raw, str) else None
+    except json.JSONDecodeError as exc:
+        raise IntegrityError("R-20 tars-revoke direct URL is malformed") from exc
+    if direct_url != {"url": workspace_root.as_uri(), "dir_info": {"editable": True}}:
+        raise IntegrityError("R-20 tars-revoke was not installed editable from the fresh clone")
+    base_prefix = Path(
+        _required_text(payload.get("sys_base_prefix"), "Python base prefix")
+    )
+    stdlib_path = Path(_required_text(payload.get("stdlib_path"), "Python stdlib path"))
+    if (
+        not base_prefix.is_absolute()
+        or not stdlib_path.is_absolute()
+        or base_prefix not in stdlib_path.parents
+    ):
+        raise IntegrityError("R-20 Python standard library path is outside its base runtime")
+    for key in ("site_packages", "sys_path"):
+        rows = payload.get(key)
+        if not isinstance(rows, list) or any(not isinstance(item, str) for item in rows):
+            raise IntegrityError(f"R-20 Python {key} provenance is malformed")
+    site_packages = cast(list[str], payload["site_packages"])
+    if not site_packages or any(
+        not Path(path).is_absolute() or venv not in Path(path).parents
+        for path in site_packages
+    ):
+        raise IntegrityError("R-20 Python site-packages escaped the qualified virtualenv")
+    sys_path = cast(list[str], payload["sys_path"])
+    allowed_sys_path_roots = (workspace_root, venv, base_prefix)
+    if any(
+        path
+        and (
+            not Path(path).is_absolute()
+            or not any(
+                Path(path) == allowed or allowed in Path(path).parents
+                for allowed in allowed_sys_path_roots
+            )
+        )
+        for path in sys_path
+    ):
+        raise IntegrityError("R-20 Python sys.path escaped the qualified runtime")
+
+    modules = payload.get("loaded_modules")
+    if not isinstance(modules, list) or not modules:
+        raise IntegrityError("R-20 loaded Python module evidence is missing")
+    module_names: set[str] = set()
+    tars_modules: set[str] = set()
+    for module in modules:
+        if not isinstance(module, Mapping) or set(module) != {
+            "name",
+            "path",
+            "source_relative",
+            "sha256",
+            "size",
+        }:
+            raise IntegrityError("R-20 loaded Python module evidence is malformed")
+        name = _required_text(module.get("name"), "loaded module name")
+        path = _required_text(module.get("path"), "loaded module path")
+        digest = module.get("sha256")
+        size = module.get("size")
+        if (
+            name in module_names
+            or not Path(path).is_absolute()
+            or not isinstance(digest, str)
+            or not _SHA256_RE.fullmatch(digest)
+            or type(size) is not int
+            or size < 0
+        ):
+            raise IntegrityError("R-20 loaded Python module evidence is malformed")
+        module_names.add(name)
+        relative = module.get("source_relative")
+        if name == "tars_revoke" or name.startswith("tars_revoke."):
+            tars_modules.add(name)
+            if not isinstance(relative, str) or not relative.startswith("src/tars_revoke/"):
+                raise IntegrityError("R-20 imported TARS module escaped the source commit")
+            source_entry = source_files.get(relative)
+            if not isinstance(source_entry, Mapping) or source_entry.get("sha256") != digest:
+                raise IntegrityError("R-20 imported TARS module differs from the source manifest")
+        elif relative is not None and not isinstance(relative, str):
+            raise IntegrityError("R-20 loaded module source path is malformed")
+        elif relative is None:
+            inventory_entry = inventory_by_path.get(path)
+            if (
+                not isinstance(inventory_entry, Mapping)
+                or inventory_entry.get("kind") != "file"
+                or inventory_entry.get("sha256") != digest
+            ):
+                raise IntegrityError(
+                    "R-20 loaded dependency module is absent from the runtime inventory"
+                )
+    if not {"tars_revoke", "tars_revoke.cli"}.issubset(tars_modules):
+        raise IntegrityError("R-20 Python provenance did not import the TARS CLI")
+
+    distributions = payload.get("distributions")
+    if not isinstance(distributions, list) or not distributions:
+        raise IntegrityError("R-20 Python distribution evidence is missing")
+    distribution_names: set[str] = set()
+    tars_distribution: Mapping[str, Any] | None = None
+    for distribution in distributions:
+        if not isinstance(distribution, Mapping) or set(distribution) != {
+            "name",
+            "version",
+            "record_path",
+            "record_sha256",
+            "direct_url",
+        }:
+            raise IntegrityError("R-20 Python distribution evidence is malformed")
+        name = _required_text(distribution.get("name"), "Python distribution name")
+        normalized = re.sub(r"[-_.]+", "-", name).lower()
+        if normalized in distribution_names or not isinstance(distribution.get("version"), str):
+            raise IntegrityError("R-20 Python distribution evidence is malformed")
+        distribution_names.add(normalized)
+        record_path = distribution.get("record_path")
+        record_digest = distribution.get("record_sha256")
+        if (record_path is None) != (record_digest is None) or (
+            record_path is not None
+            and (
+                not isinstance(record_path, str)
+                or not Path(record_path).is_absolute()
+                or not isinstance(record_digest, str)
+                or not _SHA256_RE.fullmatch(record_digest)
+            )
+        ):
+            raise IntegrityError("R-20 Python distribution RECORD evidence is malformed")
+        if record_path is not None:
+            record_entry = inventory_by_path.get(record_path)
+            if (
+                venv not in Path(record_path).parents
+                or not isinstance(record_entry, Mapping)
+                or record_entry.get("kind") != "file"
+                or record_entry.get("sha256") != record_digest
+            ):
+                raise IntegrityError(
+                    "R-20 Python distribution RECORD is outside the runtime inventory"
+                )
+        direct = distribution.get("direct_url")
+        if direct is not None and not isinstance(direct, str):
+            raise IntegrityError("R-20 Python distribution direct URL is malformed")
+        if normalized == "tars-revoke":
+            tars_distribution = distribution
+    if (
+        tars_distribution is None
+        or tars_distribution.get("version") != payload.get("distribution_version")
+        or tars_distribution.get("direct_url") != direct_url_raw
+        or tars_distribution.get("record_sha256") is None
+    ):
+        raise IntegrityError("R-20 installed tars-revoke distribution evidence is incomplete")
+    return {
+        "python_invocation_path": invocation,
+        "python_resolved_path": resolved_executable,
+        "python_executable_sha256": executable_digest,
+        "python_runtime_inventory_digest": str(inventory_digest),
+    }
+
+
 def verify_qualification_journal(
     record_path: Path,
     *,
@@ -1921,12 +2502,7 @@ def verify_qualification_journal(
         canonical_digest(unsigned), str(integrity.get("canonical_digest", ""))
     ):
         raise IntegrityError("qualification journal canonical digest changed")
-    environment_policy = record.get("environment_policy")
-    if environment_policy != {
-        "protocol": "tars.qualification-environment/v1",
-        "blocked_keys": ["TARS_RUN_LIVE_CODEX"],
-    }:
-        raise IntegrityError("R-20 qualification environment policy is missing or unsafe")
+    _verify_qualification_environment_policy(record.get("environment_policy"))
 
     source = record.get("source")
     if not isinstance(source, Mapping):
@@ -1947,6 +2523,16 @@ def verify_qualification_journal(
         "tars_revoke_executable",
         "tars_revoke_executable_sha256",
         "tars_revoke_executable_evidence_path",
+        "tars_revoke_installed_entrypoint",
+        "python_runtime_path",
+        "python_runtime_sha256",
+        "python_executable_evidence_path",
+        "python_executable_sha256",
+        "python_invocation_path",
+        "python_resolved_path",
+        "python_runtime_inventory_path",
+        "python_runtime_inventory_sha256",
+        "python_runtime_inventory_digest",
         "codex_executable",
         "codex_executable_sha256",
         "codex_executable_version",
@@ -2008,6 +2594,9 @@ def verify_qualification_journal(
     if not isinstance(files, list) or not files:
         raise IntegrityError("R-20 source tree manifest is empty")
     _verify_source_manifest_files(files)
+    source_files = {
+        str(entry.get("path")): entry for entry in files if isinstance(entry, Mapping)
+    }
     source_tree_digest = canonical_digest(source_manifest)
     if source.get("source_tree_digest") != source_tree_digest:
         raise IntegrityError("R-20 source tree digest differs from its manifest")
@@ -2021,6 +2610,10 @@ def verify_qualification_journal(
     )
     if source.get("tars_revoke_executable") != tars_executable:
         raise IntegrityError("R-20 qualification used an unexpected tars-revoke executable")
+    if source.get("tars_revoke_installed_entrypoint") != str(
+        workspace_root / ".venv" / "bin" / "tars-revoke"
+    ):
+        raise IntegrityError("R-20 installed console entry point path is not canonical")
     tars_evidence = _safe_file(
         root,
         source.get("tars_revoke_executable_evidence_path"),
@@ -2029,6 +2622,13 @@ def verify_qualification_journal(
     tars_digest = sha256_digest(tars_evidence.read_bytes())
     if source.get("tars_revoke_executable_sha256") != tars_digest:
         raise IntegrityError("R-20 qualified tars-revoke executable digest changed")
+    runtime_proof = _verify_python_runtime_record(
+        root,
+        source,
+        workspace_root=workspace_root,
+        source_files=source_files,
+        entrypoint_bytes=tars_evidence.read_bytes(),
+    )
     codex_executable = _required_text(source.get("codex_executable"), "Codex executable")
     codex_path = Path(codex_executable).expanduser()
     codex_bundle = _desktop_codex_bundle(codex_path)
@@ -2126,7 +2726,11 @@ def verify_qualification_journal(
             _required_text(attempt.get("recorded_output_root"), "attempt output root")
         )
         expected_argv = (
-            tars_executable,
+            runtime_proof["python_invocation_path"],
+            "-I",
+            "-B",
+            "-m",
+            "tars_revoke.cli",
             "demo",
             "--scenario",
             "external-schema-v2",
@@ -2143,6 +2747,10 @@ def verify_qualification_journal(
             expected_cwd=str(workspace_root),
             expected_source_commit=source_commit,
             expected_executable_digest=tars_digest,
+            expected_runtime_inventory_digest=runtime_proof[
+                "python_runtime_inventory_digest"
+            ],
+            runtime_snapshot_required=True,
         )
         started = _aware_datetime(attempt.get("started_at"), "attempt started_at")
         finished = _aware_datetime(attempt.get("finished_at"), "attempt finished_at")
@@ -2192,6 +2800,11 @@ def verify_qualification_journal(
             raise IntegrityError("R-20 discovered run ID differs from its receipt")
         if attempt.get("receipt_sha256") != receipt_digest:
             raise IntegrityError("R-20 discovered receipt hash differs from its bytes")
+        _verify_qualified_python_bundle(
+            bundle_root,
+            python_resolved_path=runtime_proof["python_resolved_path"],
+            python_executable_sha256=runtime_proof["python_executable_sha256"],
+        )
         bundle_roots.append(bundle_root)
         run_containers.append(run_container)
         recorded_bundle_roots.append(recorded_bundle)
@@ -2219,6 +2832,12 @@ def verify_qualification_journal(
         receipt_file_digests=(receipt_digests[0], receipt_digests[1], receipt_digests[2]),
         tars_revoke_executable=tars_executable,
         tars_revoke_executable_sha256=tars_digest,
+        python_invocation_path=runtime_proof["python_invocation_path"],
+        python_resolved_path=runtime_proof["python_resolved_path"],
+        python_executable_sha256=runtime_proof["python_executable_sha256"],
+        python_runtime_inventory_digest=runtime_proof[
+            "python_runtime_inventory_digest"
+        ],
         codex_executable=codex_executable,
         codex_executable_sha256=codex_digest,
         codex_executable_version=codex_version,
@@ -2275,6 +2894,10 @@ def verify_release_runs(
         "source_tree_digest",
         "tars_revoke_executable",
         "tars_revoke_executable_sha256",
+        "python_invocation_path",
+        "python_resolved_path",
+        "python_executable_sha256",
+        "python_runtime_inventory_digest",
         "codex_executable",
         "codex_executable_sha256",
         "codex_executable_version",
@@ -2304,6 +2927,13 @@ def verify_release_runs(
         or qualified.tars_revoke_executable != qualification.get("tars_revoke_executable")
         or qualified.tars_revoke_executable_sha256
         != qualification.get("tars_revoke_executable_sha256")
+        or qualified.python_invocation_path
+        != qualification.get("python_invocation_path")
+        or qualified.python_resolved_path != qualification.get("python_resolved_path")
+        or qualified.python_executable_sha256
+        != qualification.get("python_executable_sha256")
+        or qualified.python_runtime_inventory_digest
+        != qualification.get("python_runtime_inventory_digest")
         or qualified.codex_executable != qualification.get("codex_executable")
         or qualified.codex_executable_sha256
         != qualification.get("codex_executable_sha256")
@@ -2335,6 +2965,11 @@ def verify_release_runs(
         if verified.valid is not True:
             raise IntegrityError("R-20 nested live bundle did not verify")
         _verify_qualified_codex_bundle(bundle_root, qualified)
+        _verify_qualified_python_bundle(
+            bundle_root,
+            python_resolved_path=qualified.python_resolved_path,
+            python_executable_sha256=qualified.python_executable_sha256,
+        )
         expected = {
             "ordinal": row.get("ordinal"),
             "artifact_root": Path(str(row.get("artifact_root"))).as_posix(),
@@ -2401,6 +3036,59 @@ def _verify_qualified_codex_bundle(
         argv = session.get("supervisor_argv")
         if not isinstance(argv, list) or not argv or argv[0] != qualification.codex_executable:
             raise IntegrityError("R-20 live session supervisor argv differs from qualification")
+
+
+def _verify_qualified_python_bundle(
+    bundle_root: Path,
+    *,
+    python_resolved_path: str,
+    python_executable_sha256: str,
+) -> None:
+    """Bind R-13's executed observer to the R-20 qualified Python bytes."""
+
+    candidates_path = bundle_root / "experiments" / "candidates.json"
+    run_path = bundle_root / "experiments" / "run.json"
+    candidates = _load_object(candidates_path)
+    run = _load_object(run_path)
+    candidate_rows = candidates.get("candidates")
+    selected_id = candidates.get("selected_candidate_id")
+    if not isinstance(candidate_rows, list) or len(candidate_rows) != 3:
+        raise IntegrityError("R-20 decisive experiment candidate set is incomplete")
+    selected_rows: list[Mapping[str, Any]] = []
+    for row in candidate_rows:
+        if not isinstance(row, Mapping):
+            raise IntegrityError("R-20 decisive experiment candidate is malformed")
+        argv = row.get("argv")
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or argv[0] != python_resolved_path
+        ):
+            raise IntegrityError(
+                "R-20 decisive experiment candidate used a different Python runtime"
+            )
+        if row.get("id") == selected_id:
+            selected_rows.append(row)
+    run_argv = run.get("argv")
+    sandbox = run.get("sandbox")
+    experiment_run = run.get("experiment_run")
+    metadata = experiment_run.get("metadata") if isinstance(experiment_run, Mapping) else None
+    if (
+        len(selected_rows) != 1
+        or not isinstance(run_argv, list)
+        or not run_argv
+        or run_argv[0] != python_resolved_path
+        or run_argv != selected_rows[0].get("argv")
+        or not isinstance(metadata, Mapping)
+        or metadata.get("argv") != run_argv
+        or not isinstance(sandbox, Mapping)
+        or sandbox.get("python_invocation_path") != python_resolved_path
+        or sandbox.get("python_resolved_path") != python_resolved_path
+        or sandbox.get("python_sha256") != python_executable_sha256
+    ):
+        raise IntegrityError(
+            "R-20 decisive experiment differs from the qualified Python runtime"
+        )
 
 
 def _verify_codex_signing_record(
@@ -2514,6 +3202,8 @@ def _verify_command_record(
     expected_cwd: str,
     expected_source_commit: str,
     expected_executable_digest: str | None = None,
+    expected_runtime_inventory_digest: str | None = None,
+    runtime_snapshot_required: bool = False,
     attempt: bool = False,
 ) -> None:
     if not isinstance(value, Mapping):
@@ -2550,6 +3240,17 @@ def _verify_command_record(
                 "pre_tars_revoke_sha256",
                 "post_tars_revoke_path",
                 "post_tars_revoke_sha256",
+            }
+        )
+    if runtime_snapshot_required:
+        required.update(
+            {
+                "pre_python_runtime_path",
+                "pre_python_runtime_sha256",
+                "pre_python_runtime_digest",
+                "post_python_runtime_path",
+                "post_python_runtime_sha256",
+                "post_python_runtime_digest",
             }
         )
     if set(value) != required:
@@ -2603,6 +3304,43 @@ def _verify_command_record(
                 or executable_digest != expected_executable_digest
             ):
                 raise IntegrityError(f"R-20 {label} changed the qualified entry point")
+        if runtime_snapshot_required:
+            snapshot = _safe_file(
+                root,
+                value.get(f"{phase}_python_runtime_path"),
+                label=f"{label} {phase} Python runtime snapshot",
+            )
+            if value.get(f"{phase}_python_runtime_sha256") != sha256_digest(
+                snapshot.read_bytes()
+            ):
+                raise IntegrityError(
+                    f"R-20 {label} {phase} Python runtime snapshot digest changed"
+                )
+            snapshot_payload = _load_object(snapshot)
+            if (
+                expected_runtime_inventory_digest is None
+                or set(snapshot_payload)
+                != {
+                    "protocol",
+                    "phase",
+                    "baseline_digest",
+                    "observed_digest",
+                    "matches_baseline",
+                }
+                or snapshot_payload.get("protocol")
+                != "tars.python-runtime-snapshot/v1"
+                or snapshot_payload.get("phase") != phase
+                or snapshot_payload.get("baseline_digest")
+                != expected_runtime_inventory_digest
+                or snapshot_payload.get("observed_digest")
+                != expected_runtime_inventory_digest
+                or snapshot_payload.get("matches_baseline") is not True
+                or value.get(f"{phase}_python_runtime_digest")
+                != expected_runtime_inventory_digest
+            ):
+                raise IntegrityError(
+                    f"R-20 {label} {phase} Python runtime differs from qualification"
+                )
 
 
 def _verify_clone_record(

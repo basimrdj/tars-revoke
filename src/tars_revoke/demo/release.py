@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -25,6 +26,16 @@ from tars_revoke.errors import IntegrityError, ValidationError
 from tars_revoke.persistence.artifacts import ArtifactStore
 from tars_revoke.persistence.store import Store
 from tars_revoke.services.receipts import DEFAULT_REQUIREMENT_IDS, ReceiptBuilder
+
+_SECRET_LIKE_OUTPUT_PATTERNS = (
+    re.compile(rb"\b(?:sk|rk|ghp|github_pat|xox[baprs])-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(rb"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(
+        rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
+        rb"-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -242,9 +253,14 @@ def _copy_bundle_files(source: Path, destination: Path) -> None:
             continue
         if relative.parts[:2] == ("git", "portable"):
             continue
+        payload = path.read_bytes()
+        if any(pattern.search(payload) for pattern in _SECRET_LIKE_OUTPUT_PATTERNS):
+            raise IntegrityError(
+                "live proof bundle contains a secret-like value and cannot be released"
+            )
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, target)
+        target.write_bytes(payload)
 
 
 def _backup_database(source: Path, destination: Path) -> None:
@@ -399,10 +415,15 @@ def _copy_qualification_evidence(
     for path in _walk_regular_files(source_root):
         if any(bundle == path or bundle in path.parents for bundle in bundle_roots):
             continue
+        payload = path.read_bytes()
+        if any(pattern.search(payload) for pattern in _SECRET_LIKE_OUTPUT_PATTERNS):
+            raise IntegrityError(
+                "qualification evidence contains a secret-like value and cannot be released"
+            )
         relative = path.relative_to(source_root)
         target = target_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, target)
+        target.write_bytes(payload)
 
     source_record = _load_object(source_journal)
     source_binding = source_record.get("source")
@@ -498,6 +519,12 @@ def _write_release_ledger(
             "source_tree_digest": qualification.source_tree_digest,
             "tars_revoke_executable": qualification.tars_revoke_executable,
             "tars_revoke_executable_sha256": qualification.tars_revoke_executable_sha256,
+            "python_invocation_path": qualification.python_invocation_path,
+            "python_resolved_path": qualification.python_resolved_path,
+            "python_executable_sha256": qualification.python_executable_sha256,
+            "python_runtime_inventory_digest": (
+                qualification.python_runtime_inventory_digest
+            ),
             "codex_executable": qualification.codex_executable,
             "codex_executable_sha256": qualification.codex_executable_sha256,
             "codex_executable_version": qualification.codex_executable_version,

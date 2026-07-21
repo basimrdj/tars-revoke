@@ -29,6 +29,10 @@ _SECRET_VALUE_PATTERNS = (
     ),
 )
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_PYTHON_EXECUTABLE_NAME = re.compile(
+    r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?\Z",
+    re.IGNORECASE,
+)
 
 # These names carry runtime mechanics, never application credentials.  Process
 # callers may extend the set for one adapter, but there is no broad os.environ
@@ -141,6 +145,12 @@ def validate_argv(argv: Sequence[str]) -> tuple[str, ...]:
         if not item or "\x00" in item:
             raise ValidationError(f"argv[{index}] is empty or contains NUL")
     return normalized
+
+
+def is_python_executable(value: str | Path) -> bool:
+    """Return whether a basename is an exact conventional Python executable name."""
+
+    return _PYTHON_EXECUTABLE_NAME.fullmatch(Path(value).name) is not None
 
 
 def redact_text(value: str) -> str:

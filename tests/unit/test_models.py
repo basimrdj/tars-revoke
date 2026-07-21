@@ -11,8 +11,8 @@ from tars_revoke.domain.canonical import (
     canonical_json,
     verify_digest,
 )
-from tars_revoke.domain.enums import PremiseState, ValueSemantics
-from tars_revoke.domain.models import Premise, Run
+from tars_revoke.domain.enums import ExperimentState, PremiseState, RiskLevel, ValueSemantics
+from tars_revoke.domain.models import ExperimentCandidate, Premise, Run
 from tars_revoke.errors import IntegrityError, ValidationError
 from tars_revoke.persistence import ArtifactStore, Database, Store
 
@@ -66,6 +66,24 @@ def test_premise_digest_is_computed_validated_and_model_is_frozen(now: datetime)
         )
     with pytest.raises(PydanticValidationError, match="frozen"):
         premise.state = PremiseState.INVALIDATED  # type: ignore[misc]
+
+
+def test_experiment_argv_preserves_opaque_argument_whitespace(now: datetime) -> None:
+    observer = "print('probe')\n"
+    candidate = ExperimentCandidate(
+        id="candidate-1",
+        run_id="run-1",
+        case_id="case-1",
+        hypotheses=("uuid", "opaque"),
+        predictions={"uuid": "reject", "opaque": "accept"},
+        argv=("python", "-c", observer),
+        risk=RiskLevel.LOW,
+        estimated_runtime_ms=10,
+        state=ExperimentState.PROPOSED,
+        created_at=now,
+    )
+
+    assert candidate.argv[2] == observer
 
 
 def test_content_addressed_artifacts_are_idempotent_and_tamper_evident(

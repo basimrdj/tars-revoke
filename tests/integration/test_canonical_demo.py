@@ -79,8 +79,17 @@ async def test_canonical_demo_proves_selective_revoke_repair_and_resume(
         "canonical-deterministic:effect-agent-b-local-commit",
         result.unaffected_effect_id,
     }
-    assert receipt["experiment"]["candidate_count"] >= 3
+    assert receipt["experiment"]["candidate_count"] == 3
     assert receipt["experiment"]["exit_code"] == 0
+    assert (
+        receipt["experiment"]["evidence_hypothesis_id"]
+        == "implementation_accepts_signed_v2"
+    )
+    assert (
+        receipt["experiment"]["resolved_hypothesis_id"]
+        == "implementation_rejects_signed_v2"
+    )
+    assert receipt["experiment"]["disagreement_confirmed"] is True
     assert receipt["repair"]["live_codex"] is False
     assert "not R-14 live Codex proof" in (
         result.artifact_root / "agents" / "scripted-repair.json"

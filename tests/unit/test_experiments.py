@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from tars_revoke.errors import AuthorizationError, ValidationError
+from tars_revoke.demo.scenario import _resolve_experiment_argv
+from tars_revoke.errors import AuthorizationError, IntegrityError, ValidationError
 from tars_revoke.services.experiments import ExperimentSelector
 from tars_revoke.services.repair import (
     RepairAttempt,
@@ -42,6 +44,30 @@ def _candidate(
         estimated_runtime_ms=runtime,
         touched_files=touched,
     )
+
+
+def test_portable_experiment_python_is_bound_to_exact_runtime() -> None:
+    resolved = _resolve_experiment_argv(
+        ("python", "-B", "scripts/contract_probe.py"),
+        python_executable=Path(sys.executable),
+    )
+
+    assert resolved == (
+        str(Path(sys.executable).resolve(strict=True)),
+        "-B",
+        "scripts/contract_probe.py",
+    )
+
+    with pytest.raises(IntegrityError, match="bounded Python runtime"):
+        _resolve_experiment_argv(
+            ("sh", "-c", "echo unsafe"),
+            python_executable=Path(sys.executable),
+        )
+    with pytest.raises(IntegrityError, match="bounded Python runtime"):
+        _resolve_experiment_argv(
+            ("python-wrapper", "-B", "scripts/contract_probe.py"),
+            python_executable=Path(sys.executable),
+        )
 
 
 def test_selects_lexicographically_smallest_safe_discriminating_candidate(tmp_path: Path) -> None:

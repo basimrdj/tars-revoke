@@ -17,6 +17,7 @@ from tars_revoke.adapters.codex import (
     CodexSandbox,
 )
 from tars_revoke.adapters.processes import AsyncProcessRunner
+from tars_revoke.demo.experiment_contract import CANONICAL_EXPERIMENT_SPECS, HYPOTHESES
 from tars_revoke.demo.fixture import FixtureBuilder
 from tars_revoke.demo.live_codex import (
     _EXPERIMENT_SCHEMA,
@@ -47,9 +48,20 @@ pytestmark = pytest.mark.live
 
 
 def _fake_correction_codex(path: Path) -> Path:
-    path.write_text(
-        f"#!{sys.executable}\n"
-        + r"""
+    canonical_candidates = [
+        {
+            "id": spec.name,
+            "hypotheses": list(HYPOTHESES),
+            "predictions": spec.prediction_map,
+            "argv": list(spec.portable_argv),
+            "touched_files": [],
+            "risk": "low",
+            "estimated_runtime_ms": spec.estimated_runtime_ms,
+            "command_count": 1,
+        }
+        for spec in CANONICAL_EXPERIMENT_SPECS
+    ]
+    template = r"""
 import json
 import os
 import pathlib
@@ -90,55 +102,12 @@ else:
     counter_path.write_text(str(count + 1), encoding="utf-8")
     always_invalid = (artifact_root / "always-invalid.flag").exists()
 
-    def candidate(candidate_id, argv):
-        return {
-            "id": candidate_id,
-            "hypotheses": ["contract_v1_uuid", "contract_v2_opaque"],
-            "predictions": {
-                "contract_v1_uuid": "accepted=false",
-                "contract_v2_opaque": "accepted=true",
-            },
-            "argv": argv,
-            "touched_files": [],
-            "risk": "low",
-            "estimated_runtime_ms": 20,
-            "command_count": 1,
-        }
-
-    invalid_argv = [
-        "python",
-        "-B",
-        "-c",
-        "import json; from pathlib import import Path; from scripts.contract_probe import probe; "
-        "print(json.dumps(probe(Path('examples/customer-v2.json')), sort_keys=True))",
-    ]
-    observer_argv = [
-        "python",
-        "-B",
-        "-c",
-        "import json; from pathlib import Path; from scripts.contract_probe import probe; "
-        "print(json.dumps(probe(Path('examples/customer-v2.json')), sort_keys=True))",
-    ]
-    v1_argv = [
-        "python", "-B", "scripts/contract_probe.py", "--example",
-        "examples/customer-v1.json", "--expect", "accept",
-    ]
-    v2_argv = [
-        "python", "-B", "scripts/contract_probe.py", "--example",
-        "examples/customer-v2.json", "--expect", "reject",
-    ]
+    canonical_candidates = __CANONICAL_CANDIDATES__
     if count == 0 or always_invalid:
-        candidates = [
-            candidate("invalid-one", invalid_argv),
-            candidate("invalid-two", invalid_argv),
-            candidate("invalid-three", invalid_argv),
-        ]
+        candidates = json.loads(json.dumps(canonical_candidates))
+        candidates[0]["argv"][3] = "malformed observer"
     else:
-        candidates = [
-            candidate("observe-v2", observer_argv),
-            candidate("expect-v1", v1_argv),
-            candidate("expect-v2", v2_argv),
-        ]
+        candidates = canonical_candidates
     final_value = {"candidates": candidates}
     item_id = f"item-proposal-{count}"
 
@@ -152,7 +121,13 @@ print(json.dumps({
     "item": {"id": item_id, "type": "agent_message", "text": final},
 }))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}))
-""",
+"""
+    path.write_text(
+        f"#!{sys.executable}\n"
+        + template.replace(
+            "__CANONICAL_CANDIDATES__",
+            json.dumps(canonical_candidates, separators=(",", ":"), sort_keys=True),
+        ),
         encoding="utf-8",
     )
     path.chmod(0o700)
@@ -193,80 +168,48 @@ def test_experiment_output_schema_closes_prediction_object() -> None:
     candidates = _EXPERIMENT_SCHEMA["properties"]["candidates"]
     predictions = candidates["items"]["properties"]["predictions"]
 
+    assert candidates["minItems"] == candidates["maxItems"] == 3
+    assert candidates["items"]["properties"]["risk"]["enum"] == ["low"]
     assert predictions == {
         "type": "object",
         "properties": {
-            "contract_v1_uuid": {"type": "string"},
-            "contract_v2_opaque": {"type": "string"},
+            "implementation_rejects_signed_v2": {"type": "string"},
+            "implementation_accepts_signed_v2": {"type": "string"},
         },
-        "required": ["contract_v1_uuid", "contract_v2_opaque"],
+        "required": [
+            "implementation_rejects_signed_v2",
+            "implementation_accepts_signed_v2",
+        ],
         "additionalProperties": False,
     }
 
 
 def test_experiment_candidate_separates_domain_outcome_from_process_failure() -> None:
+    spec = CANONICAL_EXPERIMENT_SPECS[0]
     base = {
-        "id": "observe-v2",
-        "hypotheses": ["contract_v1_uuid", "contract_v2_opaque"],
-        "predictions": {
-            "contract_v1_uuid": "accepted=false",
-            "contract_v2_opaque": "accepted=true",
-        },
+        "id": spec.name,
+        "hypotheses": list(HYPOTHESES),
+        "predictions": spec.prediction_map,
         "touched_files": [],
         "risk": "low",
-        "estimated_runtime_ms": 25,
+        "estimated_runtime_ms": spec.estimated_runtime_ms,
         "command_count": 1,
     }
-    valid_argv = (
-        "python",
-        "-B",
-        "scripts/contract_probe.py",
-        "--example",
-        "examples/customer-v2.json",
-        "--expect",
-        "reject",
-    )
+    valid_argv = spec.portable_argv
     valid = {
         **base,
         "argv": list(valid_argv),
     }
     assert LiveCodexPath._experiment_candidate(valid).argv == valid_argv
 
-    path_observer = {
+    modified_observer = {
         **base,
-        "id": "observe-v2-path",
-        "argv": [
-            "python",
-            "-B",
-            "-c",
-            (
-                "import json; from pathlib import Path; "
-                "from scripts.contract_probe import probe; "
-                "print(json.dumps(probe(Path('examples/customer-v2.json')), "
-                "sort_keys=True))"
-            ),
-        ],
+        "argv": [*valid_argv[:-1], f"{valid_argv[-1]} "],
     }
-    assert LiveCodexPath._experiment_candidate(path_observer).id == "observe-v2-path"
+    with pytest.raises(CodexProtocolError, match="exact canonical observer"):
+        LiveCodexPath._experiment_candidate(modified_observer)
 
-    string_observer = {
-        **base,
-        "id": "observe-v2-string",
-        "argv": [
-            "python",
-            "-B",
-            "-c",
-            (
-                "import json; from pathlib import Path; "
-                "from scripts.contract_probe import probe; "
-                "print(json.dumps(probe('examples/customer-v2.json'), sort_keys=True))"
-            ),
-        ],
-    }
-    with pytest.raises(CodexProtocolError, match=r"pathlib\.Path fixture"):
-        LiveCodexPath._experiment_candidate(string_observer)
-
-    positional = {
+    cli_probe = {
         **base,
         "argv": [
             "python",
@@ -276,15 +219,25 @@ def test_experiment_candidate_separates_domain_outcome_from_process_failure() ->
             "reject",
         ],
     }
-    with pytest.raises(CodexProtocolError, match="invalid contract_probe argv"):
-        LiveCodexPath._experiment_candidate(positional)
+    with pytest.raises(CodexProtocolError, match="exact canonical observer"):
+        LiveCodexPath._experiment_candidate(cli_probe)
 
-    pytest_failure_channel = {
+    prefixed_python = {
         **base,
-        "argv": ["python", "-B", "-m", "pytest", "-q", "tests/test_contract.py"],
+        "argv": ["python-wrapper", *valid_argv[1:]],
     }
-    with pytest.raises(CodexProtocolError, match="invalid contract_probe argv"):
-        LiveCodexPath._experiment_candidate(pytest_failure_channel)
+    with pytest.raises(CodexProtocolError, match="bounded Python probe"):
+        LiveCodexPath._experiment_candidate(prefixed_python)
+
+    false_prediction = {
+        **valid,
+        "predictions": {
+            **spec.prediction_map,
+            HYPOTHESES[0]: spec.prediction_map[HYPOTHESES[1]],
+        },
+    }
+    with pytest.raises(CodexProtocolError, match="canonical observer"):
+        LiveCodexPath._experiment_candidate(false_prediction)
 
 
 @pytest.mark.asyncio
@@ -302,11 +255,9 @@ async def test_proposal_validation_resumes_same_real_adapter_thread(
     assert proposal.correction_count == 1
     assert len(proposal.attempts) == 2
     assert len(proposal.validation_errors) == 1
-    assert "probe result as JSON" in proposal.validation_errors[0]
+    assert "exact canonical observer" in proposal.validation_errors[0]
     assert {candidate.id for candidate in proposal.candidates} == {
-        "expect-v1",
-        "expect-v2",
-        "observe-v2",
+        spec.name for spec in CANONICAL_EXPERIMENT_SPECS
     }
     assert all(attempt.thread_id == analysis.run.thread_id for attempt in proposal.attempts)
     assert proposal.run is proposal.attempts[-1]
@@ -315,7 +266,7 @@ async def test_proposal_validation_resumes_same_real_adapter_thread(
     assert "Exact validation error:" in correction_prompt
     assert proposal.validation_errors[0] in correction_prompt
     assert "from pathlib import Path" in correction_prompt
-    assert "scripts/contract_probe.py" in correction_prompt
+    assert "scripts.contract_probe" in correction_prompt
     assert "correction turn 1 of 2" in correction_prompt
 
     roots = {attempt.artifacts.root for attempt in proposal.attempts}

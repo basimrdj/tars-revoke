@@ -32,9 +32,10 @@ The included scenario is a real isolated software system, not a narrated UI:
 4. Agent B's unrelated observability branch pushes while Agent A remains frozen.
 5. Exact before-images restore the reversible effects; the invalid commit is
    preserved under a quarantine ref and never reaches the remote.
-6. Codex proposes bounded experiments, executes the least-cost decisive probe,
-   repairs a fresh replacement worktree, runs targeted and full tests, and
-   pushes a new lineage.
+6. Codex proposes three canonical read-only observers with predeclared JSON
+   outcomes; TARS executes the least-cost probe and requires captured stdout to
+   resolve exactly one hypothesis before repairing a fresh replacement worktree,
+   running targeted and full tests, and pushing a new lineage.
 7. An independent verifier recomputes the event chain, artifact digests, causal
    membership, Git refs, remote history, test results, receipt hash, and complete
    gateway coverage.
@@ -130,8 +131,11 @@ python3 tools/qualify_release.py \
 
 Every setup/run/workflow boundary rechecks the exact Git HEAD and clean status.
 The live commands execute a sealed copy of the installed entry point and record
-its bytes before and after every run. Offline setup tests forcibly remove
-`TARS_RUN_LIVE_CODEX`, while the three explicit demo commands are the only live
+its bytes before and after every run. The driver uses an environment allowlist,
+forbids Python import/runtime overrides, and records the entry-point shebang,
+interpreter bytes, editable-package origin, imported TARS module hashes, and
+installed distribution RECORD digests. Offline setup tests cannot inherit
+`TARS_RUN_LIVE_CODEX`; the three explicit demo commands are the only live
 qualification attempts. The journal also runs and records strict macOS
 code-signature verification and binds the publisher metadata, exact pinned
 Codex binary bytes, and version. This command

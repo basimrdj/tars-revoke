@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,10 +10,14 @@ from typing import Any
 import pytest
 
 from tars_revoke.demo.crashbench import run_crashbench_suite
+from tars_revoke.demo.experiment_contract import CANONICAL_EXPERIMENT_SPECS, HYPOTHESES
 from tars_revoke.demo.release import _copy_crash_evidence
 from tars_revoke.demo.release_proofs import (
     CODEX_SIGNATURE_LIMITATION,
     FRESH_CLONE_STEPS,
+    QUALIFICATION_FIXED_ENVIRONMENT,
+    QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS,
+    QUALIFICATION_INHERITED_ENVIRONMENT_KEYS,
     QUALIFICATION_TRUST_LIMITATION,
     _verify_release_limitations,
     verify_crash_recovery,
@@ -73,6 +78,7 @@ def _live_session(
     changed_paths: list[str],
     schema_digest: str,
     before_head: str,
+    message_text: str = "{}",
 ) -> Path:
     session_root = root / "agents" / "live-codex" / "sessions" / f"{stage}-{thread_id[-4:]}"
     session_root.mkdir(parents=True)
@@ -80,7 +86,10 @@ def _live_session(
     events = [
         {"type": "thread.started", "thread_id": thread_id},
         {"type": "turn.started"},
-        {"type": "item.completed", "item": {"id": item_id, "type": "agent_message"}},
+        {
+            "type": "item.completed",
+            "item": {"id": item_id, "type": "agent_message", "text": message_text},
+        },
         {"type": "turn.completed"},
     ]
     (session_root / "events.jsonl").write_text(
@@ -88,7 +97,11 @@ def _live_session(
         encoding="utf-8",
     )
     _write_json(session_root / "changed-paths.json", changed_paths)
-    (session_root / "last-message.txt").write_text("{}", encoding="utf-8")
+    (session_root / "last-message.txt").write_text(message_text, encoding="utf-8")
+    (session_root / "event-observations.jsonl").write_text(
+        '{"event_type":"turn.completed","sequence":4}\n',
+        encoding="utf-8",
+    )
     (session_root / "stderr.log").write_bytes(b"")
     (session_root / "stdout.log").write_text("live Codex output\n", encoding="utf-8")
     diff = "".join(
@@ -99,6 +112,7 @@ def _live_session(
     files = {}
     for name in (
         "changed-paths.json",
+        "event-observations.jsonl",
         "events.jsonl",
         "last-message.txt",
         "stderr.log",
@@ -118,6 +132,7 @@ def _live_session(
         sha256_digest(executable_path.read_bytes()) if executable_path.is_file() else "a" * 64
     )
     worktree = str(root / "worktrees" / stage)
+    workspace_digest = sha256_digest(f"{stage}:{before_head}".encode())
     schema_path = root / "agents" / "live-codex" / f"output-schema-{schema_digest}.json"
     if stage.startswith("agent-b-experiments"):
         supervisor_argv = [
@@ -166,6 +181,8 @@ def _live_session(
         "worktree": worktree,
         "before_head": before_head,
         "after_head": before_head,
+        "before_workspace_digest": workspace_digest,
+        "after_workspace_digest": workspace_digest,
         "changed_paths": changed_paths,
         "item_ids": [item_id],
         "output_schema_digest": schema_digest,
@@ -224,6 +241,19 @@ def _live_proof(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any], list[Pa
         schema_digest=schema_digest,
         before_head=base_commit,
     )
+    proposed_candidates = [
+        {
+            "id": f"candidate-{index}",
+            "hypotheses": list(HYPOTHESES),
+            "predictions": spec.prediction_map,
+            "argv": list(spec.portable_argv),
+            "touched_files": [],
+            "risk": "low",
+            "estimated_runtime_ms": spec.estimated_runtime_ms,
+            "command_count": 1,
+        }
+        for index, spec in enumerate(CANONICAL_EXPERIMENT_SPECS, start=1)
+    ]
     proposal = _live_session(
         tmp_path,
         stage="agent-b-experiments",
@@ -231,6 +261,7 @@ def _live_proof(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any], list[Pa
         changed_paths=[],
         schema_digest=schema_digest,
         before_head=base_commit,
+        message_text=canonical_json({"candidates": proposed_candidates}),
     )
     proposal_observations = proposal.parent / "event-observations.jsonl"
     proposal_observations.write_text(
@@ -260,10 +291,42 @@ def _live_proof(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any], list[Pa
     r14_paths.append(repair.parent / "workspace.diff")
     r14_paths.append(proposal_observations)
     manifest = _manifest_for("R-14", tmp_path, r14_paths)
+    durable_candidates = [
+        {
+            **candidate,
+            "argv": ["/usr/bin/python3", *candidate["argv"][1:]],
+            "risk": "LOW",
+            "metadata": {
+                "proposed_by": "live-codex",
+                "proposed_argv": candidate["argv"],
+                "executable_resolution": {
+                    "kind": "scenario-python-runtime",
+                    "resolved_path": "/usr/bin/python3",
+                },
+            },
+        }
+        for candidate in proposed_candidates
+    ]
+    candidates_path = tmp_path / "experiments" / "candidates.json"
+    _write_json(
+        candidates_path,
+        {
+            "candidates": durable_candidates,
+            "decisions": [],
+            "selected_candidate_id": "candidate-1",
+            "selected_score": [0, 0, 50, 1],
+        },
+    )
+    manifest["requirements"]["R-12"] = _manifest_for(
+        "R-12",
+        tmp_path,
+        [candidates_path],
+    )["requirements"]["R-12"]
     repair_manifest = json.loads(repair.read_text(encoding="utf-8"))
     receipt = {
         "proof_scope": ["R-14"],
         "experiment": {
+            "selected_candidate_id": "candidate-1",
             "live_proposal_attempts": [
                 {
                     "attempt_index": 0,
@@ -423,7 +486,12 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
     _git(repository, "config", "user.name", "Proof")
     tracked = repository / "README.md"
     tracked.write_text("qualified source\n", encoding="utf-8")
-    _git(repository, "add", "README.md")
+    package_init = repository / "src" / "tars_revoke" / "__init__.py"
+    package_cli = repository / "src" / "tars_revoke" / "cli.py"
+    package_cli.parent.mkdir(parents=True)
+    package_init.write_text('__version__ = "0.1.0"\n', encoding="utf-8")
+    package_cli.write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+    _git(repository, "add", "README.md", "src/tars_revoke/__init__.py", "src/tars_revoke/cli.py")
     _git(repository, "commit", "-qm", "source")
     commit = _git(repository, "rev-parse", "HEAD")
 
@@ -437,7 +505,17 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
     (evidence_root / "git-head.txt").write_text(f"{commit}\n", encoding="utf-8")
     (evidence_root / "git-status.txt").write_bytes(b"")
     (evidence_root / "clean-status.txt").write_bytes(b"")
-    (evidence_root / "tars-revoke").write_text("#!/bin/sh\n", encoding="utf-8")
+    python_launcher = repository / ".venv" / "bin" / "python"
+    python_launcher.parent.mkdir(parents=True)
+    resolved_python = repository / "fixture-runtime" / "python"
+    resolved_python.parent.mkdir(parents=True)
+    resolved_python.write_bytes(b"qualified-python-runtime")
+    os.symlink(resolved_python, python_launcher)
+    installed_entrypoint = repository / ".venv" / "bin" / "tars-revoke"
+    installed_entrypoint.write_text(f"#!{python_launcher}\n", encoding="utf-8")
+    (evidence_root / "tars-revoke").write_bytes(installed_entrypoint.read_bytes())
+    python_evidence = evidence_root / "python-runtime.bin"
+    python_evidence.write_bytes(resolved_python.read_bytes())
     codex_path = tmp_path / "vendor" / "ChatGPT.app" / "Contents" / "Resources" / "codex"
     codex_bundle = codex_path.parents[2]
     codex_digest = "bdcb530615d44fcc7b35d12fe00f30c3025c25fc22a21193591dcdb064304385"
@@ -461,13 +539,120 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
         "source_commit": commit,
         "files": [
             {
-                "path": "README.md",
-                "sha256": sha256_digest(tracked.read_bytes()),
-                "size": tracked.stat().st_size,
+                "path": path.relative_to(repository).as_posix(),
+                "sha256": sha256_digest(path.read_bytes()),
+                "size": path.stat().st_size,
             }
+            for path in (tracked, package_init, package_cli)
         ],
     }
     _write_json(evidence_root / "source-manifest.json", source_manifest)
+    direct_url = json.dumps(
+        {"url": repository.as_uri(), "dir_info": {"editable": True}},
+        separators=(",", ":"),
+    )
+    site_packages = repository / ".venv" / "lib" / "site-packages"
+    record_path = site_packages / "tars_revoke-0.1.0.dist-info" / "RECORD"
+    record_path.parent.mkdir(parents=True)
+    record_path.write_text("tars_revoke/__init__.py,,\n", encoding="utf-8")
+    base_prefix = repository / "fixture-runtime"
+    stdlib_path = base_prefix / "lib" / "python3.10"
+    stdlib_path.mkdir(parents=True)
+    inventory = {
+        "protocol": "tars.python-runtime-inventory/v1",
+        "roots": [],
+        "entries": [
+            {
+                "root": str(repository / ".venv"),
+                "path": str(python_launcher),
+                "mode": 0o777,
+                "kind": "symlink",
+                "target": str(resolved_python),
+            },
+            {
+                "root": str(resolved_python),
+                "path": str(resolved_python),
+                "mode": 0o644,
+                "kind": "file",
+                "sha256": sha256_digest(resolved_python.read_bytes()),
+                "size": resolved_python.stat().st_size,
+            },
+            {
+                "root": str(repository / ".venv"),
+                "path": str(installed_entrypoint),
+                "mode": 0o644,
+                "kind": "file",
+                "sha256": sha256_digest(installed_entrypoint.read_bytes()),
+                "size": installed_entrypoint.stat().st_size,
+            },
+            {
+                "root": str(repository / ".venv"),
+                "path": str(record_path),
+                "mode": 0o644,
+                "kind": "file",
+                "sha256": sha256_digest(record_path.read_bytes()),
+                "size": record_path.stat().st_size,
+            },
+        ],
+    }
+    inventory["canonical_digest"] = canonical_digest(inventory)
+    _write_json(evidence_root / "python-runtime-inventory.json", inventory)
+    runtime_payload = {
+        "protocol": "tars.python-runtime/v1",
+        "sys_executable": str(python_launcher),
+        "sys_prefix": str(repository / ".venv"),
+        "sys_base_prefix": str(base_prefix),
+        "python_version": "3.10.11 (qualification fixture)",
+        "site_packages": [str(site_packages)],
+        "stdlib_path": str(stdlib_path),
+        "sys_path": [str(repository / "src")],
+        "package_file": str(package_init),
+        "package_file_sha256": sha256_digest(package_init.read_bytes()),
+        "distribution_name": "tars-revoke",
+        "distribution_version": "0.1.0",
+        "distribution_direct_url": direct_url,
+        "distribution_entry_points": [
+            {
+                "group": "console_scripts",
+                "name": "tars-revoke",
+                "value": "tars_revoke.cli:app",
+            }
+        ],
+        "loaded_modules": [
+            {
+                "name": "tars_revoke",
+                "path": str(package_init),
+                "source_relative": "src/tars_revoke/__init__.py",
+                "sha256": sha256_digest(package_init.read_bytes()),
+                "size": package_init.stat().st_size,
+            },
+            {
+                "name": "tars_revoke.cli",
+                "path": str(package_cli),
+                "source_relative": "src/tars_revoke/cli.py",
+                "sha256": sha256_digest(package_cli.read_bytes()),
+                "size": package_cli.stat().st_size,
+            },
+        ],
+        "distributions": [
+            {
+                "name": "tars-revoke",
+                "version": "0.1.0",
+                "record_path": str(record_path),
+                "record_sha256": sha256_digest(record_path.read_bytes()),
+                "direct_url": direct_url,
+            }
+        ],
+        "entrypoint_path": str(installed_entrypoint),
+        "entrypoint_sha256": sha256_digest(installed_entrypoint.read_bytes()),
+        "entrypoint_format": "direct-shebang",
+        "python_invocation_path": str(python_launcher),
+        "resolved_executable": str(resolved_python),
+        "resolved_executable_sha256": sha256_digest(python_evidence.read_bytes()),
+        "runtime_inventory_path": "evidence/python-runtime-inventory.json",
+        "runtime_inventory_digest": inventory["canonical_digest"],
+    }
+    _write_json(evidence_root / "python-runtime.json", runtime_payload)
     source_mirror = proof_root / "source" / "repository.git"
     source_mirror.parent.mkdir()
     subprocess.run(
@@ -526,26 +711,68 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
         bundle.mkdir(parents=True)
         receipt = bundle / "receipt.json"
         _write_json(receipt, {"run_id": f"live-{index}"})
+        selected_argv = [str(resolved_python), "-B", "-c", "print('probe')"]
+        _write_json(
+            bundle / "experiments" / "candidates.json",
+            {
+                "selected_candidate_id": "candidate-1",
+                "candidates": [
+                    {"id": f"candidate-{candidate}", "argv": selected_argv}
+                    for candidate in range(1, 4)
+                ],
+            },
+        )
+        _write_json(
+            bundle / "experiments" / "run.json",
+            {
+                "argv": selected_argv,
+                "experiment_run": {"metadata": {"argv": selected_argv}},
+                "sandbox": {
+                    "python_invocation_path": str(resolved_python),
+                    "python_resolved_path": str(resolved_python),
+                    "python_sha256": sha256_digest(python_evidence.read_bytes()),
+                },
+            },
+        )
         stdout = log_root / f"attempt-{index}.stdout.log"
         stderr = log_root / f"attempt-{index}.stderr.log"
         stdout.write_text(f"attempt {index} passed\n", encoding="utf-8")
         stderr.write_bytes(b"")
         started = now + timedelta(minutes=index * 2)
         recorded_attempt_output = runs_root
+        snapshot_records: dict[str, str] = {}
+        for phase in ("pre", "post"):
+            snapshot = {
+                "protocol": "tars.python-runtime-snapshot/v1",
+                "phase": phase,
+                "baseline_digest": inventory["canonical_digest"],
+                "observed_digest": inventory["canonical_digest"],
+                "matches_baseline": True,
+            }
+            snapshot_path = evidence_root / f"attempt-{index}.{phase}.python.json"
+            _write_json(snapshot_path, snapshot)
+            snapshot_records.update(
+                {
+                    f"{phase}_python_runtime_path": snapshot_path.relative_to(
+                        proof_root
+                    ).as_posix(),
+                    f"{phase}_python_runtime_sha256": sha256_digest(
+                        snapshot_path.read_bytes()
+                    ),
+                    f"{phase}_python_runtime_digest": inventory["canonical_digest"],
+                }
+            )
         attempts.append(
             {
                 "attempt_index": index,
                 "started_at": started.isoformat(),
                 "finished_at": (started + timedelta(minutes=1)).isoformat(),
                 "argv": [
-                    str(
-                        repository
-                        / ".tars"
-                        / "qualification"
-                        / "evidence"
-                        / "executables"
-                        / "tars-revoke"
-                    ),
+                    str(python_launcher),
+                    "-I",
+                    "-B",
+                    "-m",
+                    "tars_revoke.cli",
                     "demo",
                     "--scenario",
                     "external-schema-v2",
@@ -583,6 +810,7 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
                 "post_tars_revoke_sha256": sha256_digest(
                     (evidence_root / "tars-revoke").read_bytes()
                 ),
+                **snapshot_records,
                 "artifact_root": bundle.relative_to(proof_root).as_posix(),
                 "recorded_output_root": str(recorded_attempt_output),
                 "recorded_artifact_root": str(bundle),
@@ -618,6 +846,20 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
             (evidence_root / "tars-revoke").read_bytes()
         ),
         "tars_revoke_executable_evidence_path": "evidence/tars-revoke",
+        "tars_revoke_installed_entrypoint": str(installed_entrypoint),
+        "python_runtime_path": "evidence/python-runtime.json",
+        "python_runtime_sha256": sha256_digest(
+            (evidence_root / "python-runtime.json").read_bytes()
+        ),
+        "python_executable_evidence_path": "evidence/python-runtime.bin",
+        "python_executable_sha256": sha256_digest(python_evidence.read_bytes()),
+        "python_invocation_path": str(python_launcher),
+        "python_resolved_path": str(resolved_python),
+        "python_runtime_inventory_path": "evidence/python-runtime-inventory.json",
+        "python_runtime_inventory_sha256": sha256_digest(
+            (evidence_root / "python-runtime-inventory.json").read_bytes()
+        ),
+        "python_runtime_inventory_digest": inventory["canonical_digest"],
         "codex_executable": str(codex_path),
         "codex_executable_sha256": codex_digest,
         "codex_executable_version": "codex-cli 0.144.5",
@@ -691,8 +933,29 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
         "setup_steps": setup_steps,
         "attempts": attempts,
         "environment_policy": {
-            "protocol": "tars.qualification-environment/v1",
-            "blocked_keys": ["TARS_RUN_LIVE_CODEX"],
+            "protocol": "tars.qualification-environment/v3",
+            "inherited_allowlist": list(QUALIFICATION_INHERITED_ENVIRONMENT_KEYS),
+            "present_inherited_keys": ["PATH"],
+            "live_only_allowlist": [
+                "CODEX_API_KEY",
+                "CODEX_HOME",
+                "HOME",
+                "OPENAI_API_KEY",
+                "OPENAI_ORGANIZATION",
+                "OPENAI_ORG_ID",
+                "OPENAI_PROJECT",
+                "OPENAI_PROJECT_ID",
+            ],
+            "live_present_keys": ["CODEX_HOME", "OPENAI_API_KEY"],
+            "fixed_values": QUALIFICATION_FIXED_ENVIRONMENT,
+            "gate_injected_keys": ["HOME"],
+            "runtime_injected_keys": ["TARS_CODEX_BIN"],
+            "forbidden_keys": list(QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS),
+            "auth_key_names_present": ["OPENAI_API_KEY"],
+            "non_live_auth_keys_present": [],
+            "live_auth_sources": ["CODEX_HOME", "OPENAI_API_KEY"],
+            "gate_home_sha256": "3" * 64,
+            "path_sha256": "2" * 64,
         },
         "result": "passed",
     }
@@ -759,13 +1022,29 @@ def test_r20_journal_binds_clean_source_mirror_and_exact_attempt_sequence(
 
     unsafe_environment = json.loads(json.dumps(journal))
     unsafe_environment.pop("integrity")
-    unsafe_environment["environment_policy"]["blocked_keys"] = []
+    unsafe_environment["environment_policy"]["forbidden_keys"] = []
     unsafe_environment["integrity"] = {
         "canonical_digest": canonical_digest(unsafe_environment)
     }
     _write_json(journal_path, unsafe_environment)
     with pytest.raises(IntegrityError, match="environment policy"):
         verify_qualification_journal(journal_path)
+
+    runtime_path = evidence_root / "python-runtime.json"
+    original_runtime = runtime_path.read_bytes()
+    runtime_payload = json.loads(original_runtime)
+    runtime_payload["package_file_sha256"] = "0" * 64
+    _write_json(runtime_path, runtime_payload)
+    forged_runtime = json.loads(json.dumps(journal))
+    forged_runtime.pop("integrity")
+    forged_runtime["source"]["python_runtime_sha256"] = sha256_digest(
+        runtime_path.read_bytes()
+    )
+    forged_runtime["integrity"] = {"canonical_digest": canonical_digest(forged_runtime)}
+    _write_json(journal_path, forged_runtime)
+    with pytest.raises(IntegrityError, match="imported tars-revoke package"):
+        verify_qualification_journal(journal_path)
+    runtime_path.write_bytes(original_runtime)
 
     wrong_identity = json.loads(json.dumps(journal))
     wrong_identity.pop("integrity")

@@ -41,9 +41,9 @@ Memory answers what an agent knew. Graphs answer what is connected. Guardrails a
 10. Roll back reversible effects idempotently.
 11. Quarantine irreversible effects before dispatch; if already dispatched, report containment required and never claim rollback.
 12. Preserve invalid work on a quarantine Git ref for diagnosis.
-13. Ask Codex for typed experiment candidates with predictions under each live hypothesis.
-14. Validate candidates and deterministically select the lexicographically least costly safe discriminating experiment.
-15. Execute the chosen experiment against preserved invalid work and record raw results.
+13. Ask Codex for typed read-only experiment candidates whose predictions are canonical JSON outcomes under each live hypothesis.
+14. Recompute the exact command grammar and predictions, then deterministically select the lexicographically least costly safe discriminating experiment.
+15. Execute the chosen experiment against preserved invalid work, capture raw stdout/stderr, and proceed only when the parsed outcome matches exactly one predeclared hypothesis.
 16. Resume the affected Codex session with a bounded revocation packet, not an unbounded transcript.
 17. Require Codex to repair the migration/model and add or update a regression test.
 18. Run targeted and full test suites before authorizing replacement effects.
@@ -114,7 +114,7 @@ hosted deployment must provide equivalent protected server-side enforcement.
 - INV-06: Compensation is idempotent and refuses to overwrite an unexpected current hash.
 - INV-07: Already-visible irreversible effects are marked containment-required, never rolled back in prose.
 - INV-08: An unrelated agent cannot be paused without a dependency path.
-- INV-09: Experiment candidates record divergent predictions before execution.
+- INV-09: Experiment candidates record canonical divergent predictions before execution, and the captured outcome resolves exactly one hypothesis.
 - INV-10: No lower-scoring safe discriminating candidate exists in the recorded set.
 - INV-11: Repair uses a fresh lineage linked by `replaces` edges.
 - INV-12: Rebuilding a receipt from the same durable snapshot produces the same digest.

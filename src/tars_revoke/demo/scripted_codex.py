@@ -7,6 +7,7 @@ from pathlib import Path
 from tars_revoke.domain.enums import RiskLevel
 from tars_revoke.errors import ValidationError
 
+from .experiment_contract import CANONICAL_EXPERIMENT_SPECS, HYPOTHESES
 from .migration_contract import (
     MIGRATION_SOURCE_PATH,
     OPAQUE_CONTRACT_SQL,
@@ -135,59 +136,17 @@ class ScriptedCodex:
     ) -> tuple[ScriptedExperiment, ...]:
         _root = worktree.expanduser().resolve(strict=True)
         python = str(self.python_executable)
-        hypotheses = ("uuid_contract", "opaque_contract")
-        predictions = {
-            "uuid_contract": "v2_example_rejected",
-            "opaque_contract": "v2_example_accepted",
-        }
-        uuid_probe = """import json
-import sys
-from uuid import UUID
-
-value = json.load(open(sys.argv[1], encoding="utf-8"))["customer_id"]
-try:
-    UUID(value)
-    accepted = True
-    error = None
-except ValueError as exception:
-    accepted = False
-    error = f"{type(exception).__name__}: {exception}"
-print(json.dumps({"accepted_as_uuid": accepted, "error": error}, sort_keys=True))
-raise SystemExit(1 if accepted else 0)
-"""
-        return (
+        return tuple(
             ScriptedExperiment(
-                id=f"{case_id}-probe-v2",
-                hypotheses=hypotheses,
-                predictions=predictions,
-                argv=(
-                    python,
-                    "-c",
-                    uuid_probe,
-                    "examples/customer-v2.json",
-                ),
+                id=f"{case_id}-{spec.name}",
+                hypotheses=HYPOTHESES,
+                predictions=spec.prediction_map,
+                argv=(python, *spec.portable_argv[1:]),
                 touched_files=(),
                 risk=RiskLevel.LOW,
-                estimated_runtime_ms=50,
-            ),
-            ScriptedExperiment(
-                id=f"{case_id}-contract-test",
-                hypotheses=hypotheses,
-                predictions=predictions,
-                argv=(python, "-m", "pytest", "-q", "tests/test_contract.py"),
-                touched_files=(),
-                risk=RiskLevel.LOW,
-                estimated_runtime_ms=1_000,
-            ),
-            ScriptedExperiment(
-                id=f"{case_id}-full-suite",
-                hypotheses=hypotheses,
-                predictions=predictions,
-                argv=(python, "-m", "pytest", "-q"),
-                touched_files=(),
-                risk=RiskLevel.LOW,
-                estimated_runtime_ms=5_000,
-            ),
+                estimated_runtime_ms=spec.estimated_runtime_ms,
+            )
+            for spec in CANONICAL_EXPERIMENT_SPECS
         )
 
     def repair(self, worktree: Path, *, case_id: str) -> ScriptedRepair:

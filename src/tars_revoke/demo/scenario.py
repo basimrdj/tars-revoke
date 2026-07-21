@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from tars_revoke.adapters._safety import is_python_executable
 from tars_revoke.adapters.git import GitAdapter, GitPushTokenIssuer
 from tars_revoke.adapters.processes import AsyncProcessRunner
 from tars_revoke.adapters.sqlite_migration import SQLiteMigrationAdapter, SQLiteMigrationResult
@@ -76,6 +77,8 @@ from .concurrency import (
     build_concurrent_codex_proof,
     verify_concurrent_codex_proof,
 )
+from .experiment_contract import HYPOTHESES, matching_hypotheses
+from .experiment_sandbox import build_experiment_sandbox, workspace_manifest
 from .fixture import DemoFixture, FixtureBuilder
 from .live_codex import (
     ContradictionAnalysis,
@@ -111,6 +114,21 @@ SCENARIO_PROOF_REQUIREMENTS = (
 ALL_REQUIREMENTS = tuple(f"R-{index:02d}" for index in range(1, 21))
 SCHEMA_NAME = "billing-customer"
 SCOPE = "billing-repository"
+
+
+def _resolve_experiment_argv(
+    argv: tuple[str, ...],
+    *,
+    python_executable: Path,
+) -> tuple[str, ...]:
+    """Bind Codex's portable ``python`` grammar to the interpreter in use."""
+
+    if not argv or not is_python_executable(argv[0]):
+        raise IntegrityError("decisive experiments must use the bounded Python runtime")
+    executable = python_executable.expanduser().resolve(strict=True)
+    if not executable.is_file():
+        raise IntegrityError("decisive experiment Python runtime is not a regular file")
+    return (str(executable), *argv[1:])
 
 
 @dataclass(frozen=True)
@@ -1889,24 +1907,40 @@ class CanonicalScenario:
         if len(proposal_values) < 3:
             raise IntegrityError("Codex must propose at least three experiment candidates")
         created_at = self.store.clock.utc_now()
-        candidates = tuple(
-            ExperimentCandidate(
-                id=str(proposal["id"]),
-                run_id=self.fixture.run_id,
-                case_id=case_id,
-                hypotheses=tuple(str(item) for item in proposal["hypotheses"]),
-                predictions=dict(proposal["predictions"]),
-                argv=tuple(str(item) for item in proposal["argv"]),
-                touched_files=tuple(str(item) for item in proposal["touched_files"]),
-                risk=RiskLevel(str(getattr(proposal["risk"], "value", proposal["risk"])).upper()),
-                estimated_runtime_ms=int(proposal["estimated_runtime_ms"]),
-                command_count=int(proposal["command_count"]),
-                state=ExperimentState.PROPOSED,
-                created_at=created_at,
-                metadata={"proposed_by": proposed_by},
+        candidate_records: list[ExperimentCandidate] = []
+        for proposal in proposal_values:
+            proposed_argv = tuple(str(item) for item in proposal["argv"])
+            execution_argv = _resolve_experiment_argv(
+                proposed_argv,
+                python_executable=self.python_executable,
             )
-            for proposal in proposal_values
-        )
+            candidate_records.append(
+                ExperimentCandidate(
+                    id=str(proposal["id"]),
+                    run_id=self.fixture.run_id,
+                    case_id=case_id,
+                    hypotheses=tuple(str(item) for item in proposal["hypotheses"]),
+                    predictions=dict(proposal["predictions"]),
+                    argv=execution_argv,
+                    touched_files=tuple(str(item) for item in proposal["touched_files"]),
+                    risk=RiskLevel(
+                        str(getattr(proposal["risk"], "value", proposal["risk"])).upper()
+                    ),
+                    estimated_runtime_ms=int(proposal["estimated_runtime_ms"]),
+                    command_count=int(proposal["command_count"]),
+                    state=ExperimentState.PROPOSED,
+                    created_at=created_at,
+                    metadata={
+                        "proposed_by": proposed_by,
+                        "proposed_argv": list(proposed_argv),
+                        "executable_resolution": {
+                            "kind": "scenario-python-runtime",
+                            "resolved_path": execution_argv[0],
+                        },
+                    },
+                )
+            )
+        candidates = tuple(candidate_records)
         for candidate in candidates:
             self.store.create_experiment_candidate(candidate)
         selector = ExperimentSelector(
@@ -1949,6 +1983,46 @@ class CanonicalScenario:
             self.experiment_worktree,
             experiment_head,
         )
+        sandbox_plan = build_experiment_sandbox(
+            logical_argv=selected.argv,
+            worktree=self.experiment_worktree,
+        )
+        profile_path = self.fixture.artifacts_root / "experiments" / "sandbox.sb"
+        profile_path.write_text(sandbox_plan.profile, encoding="utf-8")
+        pre_manifest = workspace_manifest(self.experiment_worktree)
+        pre_manifest_path = (
+            self.fixture.artifacts_root / "experiments" / "worktree.pre.json"
+        )
+        self._write_json(pre_manifest_path, pre_manifest)
+        sandbox_executable_artifact = self._store_artifact_bytes(
+            Path(sandbox_plan.executable).read_bytes(),
+            media_type="application/octet-stream",
+            metadata={"kind": "experiment-sandbox-executable"},
+        )
+        python_executable_artifact = self._store_artifact_bytes(
+            Path(sandbox_plan.python_resolved_path).read_bytes(),
+            media_type="application/octet-stream",
+            metadata={"kind": "experiment-python-executable"},
+        )
+        dynamic_libraries: list[dict[str, str]] = []
+        for dependency in sandbox_plan.dynamic_libraries:
+            dependency_artifact = self._store_artifact_bytes(
+                Path(dependency["resolved_path"]).read_bytes(),
+                media_type="application/octet-stream",
+                metadata={
+                    "kind": "experiment-loader-input",
+                    "path": dependency["path"],
+                },
+            )
+            dynamic_libraries.append(
+                {**dependency, "artifact_digest": dependency_artifact.digest}
+            )
+        sandbox_record = {
+            **sandbox_plan.as_mapping(),
+            "executable_artifact_digest": sandbox_executable_artifact.digest,
+            "python_artifact_digest": python_executable_artifact.digest,
+            "dynamic_libraries": dynamic_libraries,
+        }
         premise_bindings, evidence_ids = self._premise_artifact_bindings(premise_v2)
         command_bindings = {
             **premise_bindings,
@@ -1961,6 +2035,14 @@ class CanonicalScenario:
                 commit=experiment_head,
                 tree=experiment_tree,
             ),
+            "sandbox:executable": sandbox_plan.executable_sha256,
+            "sandbox:profile": sandbox_plan.profile_sha256,
+            "sandbox:environment": sandbox_plan.environment_digest,
+            "sandbox:supervisor-argv": canonical_digest(
+                list(sandbox_plan.supervisor_argv)
+            ),
+            "sandbox:worktree-pre": str(pre_manifest["canonical_digest"]),
+            "python:resolved-executable": sandbox_plan.python_sha256,
         }
         command_target = self._command_target(
             cwd=self.experiment_worktree,
@@ -1988,6 +2070,11 @@ class CanonicalScenario:
                 "candidate_id": selected.id,
                 "argv": list(selected.argv),
                 "cwd": str(self.experiment_worktree),
+                "commit": experiment_head,
+                "tree": experiment_tree,
+                "environment": dict(sandbox_plan.environment),
+                "environment_digest": sandbox_plan.environment_digest,
+                "sandbox": sandbox_record,
             },
             risk=selected.risk,
             reversibility=Reversibility.CONDITIONAL,
@@ -2004,6 +2091,10 @@ class CanonicalScenario:
                 "cwd": str(self.experiment_worktree),
                 "commit": experiment_head,
                 "tree": experiment_tree,
+                "environment": dict(sandbox_plan.environment),
+                "environment_digest": sandbox_plan.environment_digest,
+                "sandbox": sandbox_record,
+                "worktree_pre_digest": pre_manifest["canonical_digest"],
             },
         )
         gateway = EffectGateway(self.store)
@@ -2020,13 +2111,7 @@ class CanonicalScenario:
             current_artifact_hashes=command_bindings,
             passed_test_ids=(),
         )
-        environment_digest = canonical_digest(
-            {
-                "cwd": str(self.experiment_worktree),
-                "python": str(self.python_executable),
-                "mode": "argv-only",
-            }
-        )
+        environment_digest = sandbox_plan.environment_digest
         experiment_run = ExperimentRun(
             id=self._id("experiment-run-v2-probe"),
             run_id=self.fixture.run_id,
@@ -2039,17 +2124,30 @@ class CanonicalScenario:
             metadata={
                 "selection_score": selection.score,
                 "argv": list(selected.argv),
+                "supervisor_argv": list(sandbox_plan.supervisor_argv),
+                "sandbox": sandbox_record,
+                "commit": experiment_head,
+                "tree": experiment_tree,
+                "environment": dict(sandbox_plan.environment),
+                "worktree_pre_digest": pre_manifest["canonical_digest"],
                 "effect_id": effect_intent.id,
             },
         )
         self.store.create_experiment_run(experiment_run)
         self.store.transition_experiment_run(experiment_run.id, ExperimentState.RUNNING)
         process = await self.runner.run(
-            selected.argv,
+            sandbox_plan.supervisor_argv,
             cwd=self.experiment_worktree,
             timeout_seconds=30,
+            env=sandbox_plan.environment,
+            inherited_env_keys=(),
             allowed_exit_codes=(0,),
         )
+        post_manifest = workspace_manifest(self.experiment_worktree)
+        post_manifest_path = (
+            self.fixture.artifacts_root / "experiments" / "worktree.post.json"
+        )
+        self._write_json(post_manifest_path, post_manifest)
         stdout = self._store_artifact_bytes(
             process.stdout.encode("utf-8"),
             media_type="text/plain; charset=utf-8",
@@ -2060,11 +2158,17 @@ class CanonicalScenario:
             media_type="text/plain; charset=utf-8",
             metadata={"kind": "experiment-stderr", "candidate_id": selected.id},
         )
-        if not process.succeeded:
+        workspace_unchanged = pre_manifest == post_manifest
+        if not process.succeeded or not workspace_unchanged:
+            failure_reason = (
+                f"decisive experiment exited {process.exit_code}"
+                if not process.succeeded
+                else "decisive experiment changed its read-only worktree"
+            )
             self._fail_dispatched_effect(
                 action_id=action.id,
                 effect_id=effect_intent.id,
-                reason=f"decisive experiment exited {process.exit_code}",
+                reason=failure_reason,
             )
             self.store.transition_experiment_run(
                 experiment_run.id,
@@ -2073,16 +2177,52 @@ class CanonicalScenario:
                 stdout_artifact_digest=stdout.digest,
                 stderr_artifact_digest=stderr.digest,
             )
-            raise IntegrityError("selected decisive experiment failed to execute")
+            raise IntegrityError(failure_reason)
+        semantic_failure: str | None = None
         try:
             observed_outcome: Any = json.loads(process.stdout)
         except json.JSONDecodeError:
             observed_outcome = {"raw_stdout_digest": stdout.digest}
+            semantic_failure = "decisive experiment did not emit JSON"
+        resolved_hypotheses = matching_hypotheses(
+            dict(selected.predictions),
+            observed_outcome,
+        )
+        if semantic_failure is None and len(resolved_hypotheses) != 1:
+            semantic_failure = "decisive experiment did not resolve exactly one hypothesis"
+        resolved_hypothesis_id = resolved_hypotheses[0] if len(resolved_hypotheses) == 1 else None
+        if semantic_failure is None and resolved_hypothesis_id != HYPOTHESES[0]:
+            semantic_failure = (
+                "decisive experiment did not confirm that the quarantined "
+                "implementation rejects the signed v2 example"
+            )
+        if semantic_failure is not None:
+            self._fail_dispatched_effect(
+                action_id=action.id,
+                effect_id=effect_intent.id,
+                reason=semantic_failure,
+            )
+            self.store.transition_experiment_run(
+                experiment_run.id,
+                ExperimentState.FAILED,
+                exit_code=process.exit_code,
+                observed_outcome=observed_outcome,
+                stdout_artifact_digest=stdout.digest,
+                stderr_artifact_digest=stderr.digest,
+            )
+            raise IntegrityError(semantic_failure)
+        if resolved_hypothesis_id is None:
+            raise IntegrityError("decisive experiment resolution disappeared")
         effect_observation = {
             "exit_code": process.exit_code,
             "stdout_artifact_digest": stdout.digest,
             "stderr_artifact_digest": stderr.digest,
             "observed_outcome": observed_outcome,
+            "sandbox_profile_sha256": sandbox_plan.profile_sha256,
+            "environment_digest": sandbox_plan.environment_digest,
+            "worktree_pre_digest": pre_manifest["canonical_digest"],
+            "worktree_post_digest": post_manifest["canonical_digest"],
+            "workspace_unchanged": workspace_unchanged,
         }
         effect_artifact = self._store_artifact_json(effect_observation)
         completed_effect = EffectRecord.model_validate(
@@ -2103,11 +2243,30 @@ class CanonicalScenario:
             stdout_artifact_digest=stdout.digest,
             stderr_artifact_digest=stderr.digest,
         )
+        persisted_candidates = [
+            self.store.get_experiment_candidate(candidate.id) for candidate in candidates
+        ]
+        if any(candidate is None for candidate in persisted_candidates):
+            raise IntegrityError("experiment candidate disappeared before proof generation")
+        durable_candidates = tuple(
+            cast(ExperimentCandidate, candidate) for candidate in persisted_candidates
+        )
+        durable_selected = next(
+            candidate for candidate in durable_candidates if candidate.id == selected.id
+        )
+        durable_selection = ExperimentSelection(
+            candidate=durable_selected,
+            score=selection.score,
+            decisions=selection.decisions,
+        )
         candidates_path = self.fixture.artifacts_root / "experiments" / "candidates.json"
         self._write_json(
             candidates_path,
             {
-                "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+                "candidates": [
+                    candidate.model_dump(mode="json")
+                    for candidate in durable_candidates
+                ],
                 "decisions": [
                     {
                         "candidate_id": decision.candidate_id,
@@ -2126,12 +2285,34 @@ class CanonicalScenario:
             run_path,
             {
                 "experiment_run": completed.model_dump(mode="json"),
-                "argv": process.argv,
+                "argv": list(selected.argv),
+                "supervisor_argv": list(process.argv),
                 "cwd": process.cwd,
+                "commit": experiment_head,
+                "tree": experiment_tree,
+                "environment": dict(sandbox_plan.environment),
+                "environment_digest": sandbox_plan.environment_digest,
+                "sandbox": sandbox_record,
+                "sandbox_profile_path": profile_path.relative_to(
+                    self.fixture.artifacts_root
+                ).as_posix(),
+                "sandbox_profile_sha256": sandbox_plan.profile_sha256,
+                "worktree_pre_manifest_path": pre_manifest_path.relative_to(
+                    self.fixture.artifacts_root
+                ).as_posix(),
+                "worktree_post_manifest_path": post_manifest_path.relative_to(
+                    self.fixture.artifacts_root
+                ).as_posix(),
+                "worktree_pre_digest": pre_manifest["canonical_digest"],
+                "worktree_post_digest": post_manifest["canonical_digest"],
+                "workspace_unchanged": workspace_unchanged,
                 "exit_code": process.exit_code,
                 "stdout_artifact_digest": stdout.digest,
                 "stderr_artifact_digest": stderr.digest,
                 "observed_outcome": observed_outcome,
+                "evidence_hypothesis_id": HYPOTHESES[1],
+                "resolved_hypothesis_id": resolved_hypothesis_id,
+                "disagreement_confirmed": True,
             },
         )
         return {
@@ -2140,14 +2321,23 @@ class CanonicalScenario:
             "effect_id": completed_effect.id,
             "command_target": command_target,
             "candidate_count": len(candidates),
-            "candidates": candidates,
-            "selection": selection,
+            "candidates": durable_candidates,
+            "selection": durable_selection,
             "run": completed,
             "process": process,
             "stdout_digest": stdout.digest,
             "stderr_digest": stderr.digest,
+            "evidence_hypothesis_id": HYPOTHESES[1],
+            "resolved_hypothesis_id": resolved_hypothesis_id,
             "candidates_path": candidates_path,
             "run_path": run_path,
+            "sandbox_profile_path": profile_path,
+            "worktree_pre_manifest_path": pre_manifest_path,
+            "worktree_post_manifest_path": post_manifest_path,
+            "sandbox": sandbox_record,
+            "environment": dict(sandbox_plan.environment),
+            "commit": experiment_head,
+            "tree": experiment_tree,
         }
 
     async def _repair_under_v2(
@@ -3025,6 +3215,10 @@ class CanonicalScenario:
                     "candidate_id": experiment["selection"].candidate.id,
                     "command_target": experiment["command_target"],
                     "argv": list(experiment["selection"].candidate.argv),
+                    "sandbox": experiment["sandbox"],
+                    "environment": experiment["environment"],
+                    "commit": experiment["commit"],
+                    "tree": experiment["tree"],
                 },
             ),
             self._authorization_entry(
@@ -3119,7 +3313,12 @@ class CanonicalScenario:
                 "R-10": [Path(compensation["quarantine_path"])],
                 "R-11": [Path(compensation["quarantine_path"])],
                 "R-12": [Path(experiment["candidates_path"])],
-                "R-13": [Path(experiment["run_path"])],
+                "R-13": [
+                    Path(experiment["run_path"]),
+                    Path(experiment["sandbox_profile_path"]),
+                    Path(experiment["worktree_pre_manifest_path"]),
+                    Path(experiment["worktree_post_manifest_path"]),
+                ],
                 "R-15": [
                     Path(tests["targeted"]["proof_path"]),
                     Path(tests["full"]["proof_path"]),
@@ -3277,6 +3476,15 @@ class CanonicalScenario:
                 "stdout_artifact_digest": experiment["stdout_digest"],
                 "stderr_artifact_digest": experiment["stderr_digest"],
                 "observed_outcome": experiment_run.observed_outcome,
+                "environment": experiment["environment"],
+                "environment_digest": experiment_run.environment_digest,
+                "sandbox": experiment["sandbox"],
+                "commit": experiment["commit"],
+                "tree": experiment["tree"],
+                "workspace_unchanged": True,
+                "evidence_hypothesis_id": experiment["evidence_hypothesis_id"],
+                "resolved_hypothesis_id": experiment["resolved_hypothesis_id"],
+                "disagreement_confirmed": True,
                 "live_proposal_attempts": (
                     [
                         {

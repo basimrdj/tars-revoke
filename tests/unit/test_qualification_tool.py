@@ -11,7 +11,14 @@ from types import ModuleType
 
 import pytest
 
-from tars_revoke.demo.release_proofs import _PINNED_CODEX_RELEASES as VERIFIER_CODEX_RELEASES
+from tars_revoke.demo.release_proofs import (
+    _PINNED_CODEX_RELEASES as VERIFIER_CODEX_RELEASES,
+)
+from tars_revoke.demo.release_proofs import (
+    QUALIFICATION_FIXED_ENVIRONMENT,
+    QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS,
+    QUALIFICATION_INHERITED_ENVIRONMENT_KEYS,
+)
 
 
 def _tool() -> ModuleType:
@@ -35,7 +42,11 @@ def _git(repository: Path, *args: str) -> str:
 
 
 def test_qualification_and_verifier_share_the_pinned_codex_catalog() -> None:
-    assert _tool()._PINNED_CODEX_RELEASES == VERIFIER_CODEX_RELEASES
+    tool = _tool()
+    assert tool._PINNED_CODEX_RELEASES == VERIFIER_CODEX_RELEASES
+    assert tool._INHERITED_ENVIRONMENT_KEYS == QUALIFICATION_INHERITED_ENVIRONMENT_KEYS
+    assert tool._FIXED_ENVIRONMENT == QUALIFICATION_FIXED_ENVIRONMENT
+    assert tool._FORBIDDEN_ENVIRONMENT_KEYS == QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS
 
 
 def test_clean_clone_setup_builds_forced_frontend_before_editable_install() -> None:
@@ -43,7 +54,7 @@ def test_clean_clone_setup_builds_forced_frontend_before_editable_install() -> N
     setup = makefile.split("setup:\n", maxsplit=1)[1].split("\nlint:\n", maxsplit=1)[0]
 
     assert setup.index("$(MAKE) web-install web-build") < setup.index(
-        ".venv/bin/python -m pip install -e '.[dev]'"
+        "uv sync --frozen --extra dev"
     )
 
 
@@ -211,6 +222,8 @@ import sys
 
 if sys.argv[1] == "test-python-offline" and "TARS_RUN_LIVE_CODEX" in os.environ:
     raise SystemExit(9)
+if "PYTHONPATH" in os.environ:
+    raise SystemExit(10)
 
 if sys.argv[1] == "setup":
     target = pathlib.Path.cwd() / ".venv" / "bin" / "tars-revoke"
@@ -307,10 +320,68 @@ print(f"fake make {sys.argv[1]}")
         "_PINNED_CODEX_RELEASES",
         {"codex-cli qualification-test": hashlib.sha256(fake_codex.read_bytes()).hexdigest()},
     )
-    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("TARS_RUN_LIVE_CODEX", "1")
+
+    def fake_python_runtime(
+        journal_root: Path,
+        **_kwargs: object,
+    ) -> dict[str, str]:
+        runtime = journal_root / "evidence" / "python" / "runtime.json"
+        inventory = journal_root / "evidence" / "python" / "runtime-inventory.json"
+        executable = journal_root / "evidence" / "executables" / "python-runtime"
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        runtime.write_text('{"protocol":"fixture"}\n', encoding="utf-8")
+        inventory_payload = {
+            "protocol": "tars.python-runtime-inventory/v1",
+            "roots": [],
+            "entries": [],
+        }
+        inventory_payload["canonical_digest"] = tool._canonical_digest(inventory_payload)
+        inventory.write_text(json.dumps(inventory_payload, sort_keys=True), encoding="utf-8")
+        executable.write_bytes(b"fixture-python")
+        return {
+            "python_runtime_path": runtime.relative_to(journal_root).as_posix(),
+            "python_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+            "python_executable_evidence_path": executable.relative_to(journal_root).as_posix(),
+            "python_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+            "python_invocation_path": str(workspace / ".venv" / "bin" / "python"),
+            "python_resolved_path": str(workspace / "fixture-python"),
+            "python_runtime_inventory_path": inventory.relative_to(journal_root).as_posix(),
+            "python_runtime_inventory_sha256": hashlib.sha256(inventory.read_bytes()).hexdigest(),
+            "python_runtime_inventory_digest": inventory_payload["canonical_digest"],
+        }
 
     workspace = tmp_path / "qualified-clone"
+    original_execute = tool._execute
+
+    def fake_execute(
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        timeout_seconds: int,
+        environment: dict[str, str],
+    ) -> tuple[int, bytes, bytes]:
+        if argv[1:5] == ("-I", "-B", "-m", "tars_revoke.cli"):
+            return original_execute(
+                (str(workspace / ".venv" / "bin" / "tars-revoke"), *argv[5:]),
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                environment=environment,
+            )
+        return original_execute(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            environment=environment,
+        )
+
+    monkeypatch.setattr(tool, "_python_runtime_record", fake_python_runtime)
+    monkeypatch.setattr(tool, "_execute", fake_execute)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("OPENAI_API_KEY", "qualification-fixture-secret")
+    monkeypatch.setenv("PYTHONPATH", "unsafe-ambient-import-path")
+    monkeypatch.setenv("TARS_RUN_LIVE_CODEX", "1")
+
     journal_path = tool.qualify(source=source, workspace=workspace, timeout_seconds=30)
 
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
@@ -344,10 +415,16 @@ print(f"fake make {sys.argv[1]}")
     assert journal["source"]["tars_revoke_executable"] == str(
         journal_path.parent / "evidence" / "executables" / "tars-revoke"
     )
-    assert journal["environment_policy"] == {
-        "protocol": "tars.qualification-environment/v1",
-        "blocked_keys": ["TARS_RUN_LIVE_CODEX"],
-    }
+    assert journal["environment_policy"]["inherited_allowlist"] == list(
+        QUALIFICATION_INHERITED_ENVIRONMENT_KEYS
+    )
+    assert journal["environment_policy"]["fixed_values"] == QUALIFICATION_FIXED_ENVIRONMENT
+    assert journal["environment_policy"]["forbidden_keys"] == list(
+        QUALIFICATION_FORBIDDEN_ENVIRONMENT_KEYS
+    )
+    assert "PYTHONPATH" not in journal["environment_policy"]["present_inherited_keys"]
+    assert journal["environment_policy"]["non_live_auth_keys_present"] == []
+    assert journal["environment_policy"]["auth_key_names_present"] == ["OPENAI_API_KEY"]
     assert journal["source"]["codex_executable_version"] == (
         "codex-cli qualification-test"
     )

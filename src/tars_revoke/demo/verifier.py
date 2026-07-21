@@ -5,26 +5,37 @@ import subprocess
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from tars_revoke.adapters._safety import is_python_executable
 from tars_revoke.demo.concurrency import verify_concurrent_codex_proof
+from tars_revoke.demo.experiment_contract import HYPOTHESES, matching_hypotheses
+from tars_revoke.demo.experiment_sandbox import (
+    EXPERIMENT_ENVIRONMENT,
+    SANDBOX_BACKEND,
+    render_macos_profile,
+)
 from tars_revoke.demo.release_proofs import (
+    requirement_paths,
     verify_crash_recovery,
     verify_live_codex_repair,
     verify_release_runs,
     verify_revokebench,
 )
-from tars_revoke.domain.canonical import canonical_digest, sha256_digest
+from tars_revoke.domain.canonical import canonical_digest, canonical_json, sha256_digest
 from tars_revoke.domain.enums import (
     EffectState,
+    ExperimentState,
     LeaseState,
     ReceiptState,
     RevocationMemberKind,
     SessionState,
     TestState,
 )
+from tars_revoke.domain.models import ExperimentCandidate
 from tars_revoke.errors import IntegrityError, ValidationError
 from tars_revoke.persistence.store import Store
+from tars_revoke.services.experiments import ExperimentSelector
 from tars_revoke.services.receipts import (
     DEFAULT_REQUIREMENT_IDS,
     StrictReceiptVerifier,
@@ -89,6 +100,67 @@ def _git(repository: Path, *args: str) -> str:
             f"{result.stderr.strip() or result.stdout.strip()}"
         )
     return result.stdout.strip()
+
+
+def _git_worktree_manifest(repository: Path, commit: str) -> dict[str, dict[str, Any]]:
+    result = subprocess.run(
+        ("git", "-C", str(repository), "ls-tree", "-r", "-z", "--full-tree", commit),
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise IntegrityError("cannot enumerate the decisive experiment Git tree")
+    manifest: dict[str, dict[str, Any]] = {}
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, raw_path = raw.split(b"\t", 1)
+            mode, object_type, object_id = metadata.decode("ascii").split(" ", 2)
+            path = raw_path.decode("utf-8", errors="strict")
+        except (UnicodeError, ValueError) as exc:
+            raise IntegrityError("Git returned a malformed decisive experiment tree") from exc
+        if object_type != "blob" or mode not in {"100644", "100755"}:
+            raise IntegrityError("decisive experiment tree contains an unsupported entry")
+        blob = subprocess.run(
+            ("git", "-C", str(repository), "cat-file", "blob", object_id),
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        if blob.returncode != 0:
+            raise IntegrityError("cannot read a decisive experiment Git blob")
+        manifest[path] = {
+            "path": path,
+            "sha256": sha256_digest(blob.stdout),
+            "size": len(blob.stdout),
+            "mode": 0o755 if mode == "100755" else 0o644,
+        }
+    if not manifest:
+        raise IntegrityError("decisive experiment Git tree is empty")
+    return manifest
+
+
+def _relative_proof_file(root: Path, value: object, *, label: str) -> Path:
+    if not isinstance(value, str) or not value or Path(value).is_absolute():
+        raise IntegrityError(f"R-13 {label} must be a bundle-relative path")
+    path = (root / value).resolve()
+    if root.resolve() not in path.parents or not path.is_file() or path.is_symlink():
+        raise IntegrityError(f"R-13 {label} is missing or unsafe")
+    return path
+
+
+def _proof_object_bytes(root: Path, value: object, *, label: str) -> bytes:
+    if not isinstance(value, str) or len(value) != 64:
+        raise IntegrityError(f"R-13 {label} artifact digest is malformed")
+    path = root / "objects" / value[:2] / value[2:]
+    if not path.is_file() or path.is_symlink():
+        raise IntegrityError(f"R-13 {label} artifact is missing or unsafe")
+    payload = path.read_bytes()
+    if sha256_digest(payload) != value:
+        raise IntegrityError(f"R-13 {label} artifact digest changed")
+    return payload
 
 
 def _receipt_git_path(
@@ -601,6 +673,494 @@ def _verify_authorization_coverage(
     return True
 
 
+def _verify_decisive_experiment(
+    root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    store: Store,
+    receipt: Mapping[str, Any],
+    case_id: str,
+) -> bool:
+    """Recompute R-12 selection and bind R-13 to durable execution evidence."""
+
+    candidate_paths = [
+        path for path in requirement_paths(root, manifest, "R-12") if path.name == "candidates.json"
+    ]
+    run_paths = [
+        path for path in requirement_paths(root, manifest, "R-13") if path.name == "run.json"
+    ]
+    if len(candidate_paths) != 1 or len(run_paths) != 1:
+        raise IntegrityError("decisive experiment requires one candidate and one run proof")
+    candidate_proof = _load_object(candidate_paths[0])
+    run_proof = _load_object(run_paths[0])
+    if set(run_proof) != {
+        "experiment_run",
+        "argv",
+        "supervisor_argv",
+        "cwd",
+        "commit",
+        "tree",
+        "environment",
+        "environment_digest",
+        "sandbox",
+        "sandbox_profile_path",
+        "sandbox_profile_sha256",
+        "worktree_pre_manifest_path",
+        "worktree_post_manifest_path",
+        "worktree_pre_digest",
+        "worktree_post_digest",
+        "workspace_unchanged",
+        "exit_code",
+        "stdout_artifact_digest",
+        "stderr_artifact_digest",
+        "observed_outcome",
+        "evidence_hypothesis_id",
+        "resolved_hypothesis_id",
+        "disagreement_confirmed",
+    }:
+        raise IntegrityError("R-13 run proof has unexpected fields")
+    experiment_cwd_raw = run_proof.get("cwd")
+    if not isinstance(experiment_cwd_raw, str) or not Path(experiment_cwd_raw).is_absolute():
+        raise IntegrityError("R-13 experiment cwd is not an absolute path")
+    experiment_cwd = Path(experiment_cwd_raw)
+    if set(candidate_proof) != {
+        "candidates",
+        "decisions",
+        "selected_candidate_id",
+        "selected_score",
+    }:
+        raise IntegrityError("R-12 candidate proof has unexpected fields")
+    candidate_rows = candidate_proof.get("candidates")
+    if not isinstance(candidate_rows, list) or any(
+        not isinstance(row, Mapping) for row in candidate_rows
+    ):
+        raise IntegrityError("R-12 candidate proof is malformed")
+    durable_candidates = store.list_experiment_candidates(case_id)
+    durable_by_id = {candidate.id: candidate for candidate in durable_candidates}
+    row_ids = [str(row.get("id", "")) for row in candidate_rows]
+    if (
+        len(candidate_rows) < 3
+        or len(row_ids) != len(set(row_ids))
+        or set(row_ids) != set(durable_by_id)
+    ):
+        raise IntegrityError("R-12 candidate proof differs from durable candidates")
+    ordered_candidates: list[ExperimentCandidate] = []
+    for row, candidate_id in zip(candidate_rows, row_ids, strict=True):
+        candidate = durable_by_id[candidate_id]
+        if dict(row) != candidate.model_dump(mode="json"):
+            raise IntegrityError("R-12 candidate row differs from durable state")
+        executable = Path(candidate.argv[0])
+        metadata = candidate.metadata
+        resolution = metadata.get("executable_resolution")
+        proposed_argv = metadata.get("proposed_argv")
+        if (
+            not executable.is_absolute()
+            or not is_python_executable(executable)
+            or not isinstance(proposed_argv, list)
+            or not proposed_argv
+            or any(not isinstance(item, str) or not item for item in proposed_argv)
+            or not is_python_executable(proposed_argv[0])
+            or not isinstance(resolution, Mapping)
+            or resolution.get("kind") != "scenario-python-runtime"
+            or resolution.get("resolved_path") != candidate.argv[0]
+            or list(candidate.argv[1:]) != proposed_argv[1:]
+        ):
+            raise IntegrityError("R-12 executable resolution is incomplete or inconsistent")
+        ordered_candidates.append(candidate)
+
+    selector = ExperimentSelector(
+        allowed_roots=(experiment_cwd,),
+        allowed_executables={Path(candidate.argv[0]).name for candidate in ordered_candidates},
+        maximum_risk_rank=1,
+    )
+    selection = selector.select(
+        ordered_candidates,
+        live_hypothesis_ids=ordered_candidates[0].hypotheses,
+        minimum_candidates=3,
+    )
+    expected_decisions = [
+        {
+            "candidate_id": decision.candidate_id,
+            "accepted": decision.accepted,
+            "reasons": list(decision.reasons),
+            "score": list(decision.score) if decision.score is not None else None,
+        }
+        for decision in selection.decisions
+    ]
+    if candidate_proof.get("decisions") != expected_decisions:
+        raise IntegrityError("R-12 candidate decisions do not recompute")
+    selected = cast(ExperimentCandidate, selection.candidate)
+    if (
+        candidate_proof.get("selected_candidate_id") != selected.id
+        or candidate_proof.get("selected_score") != list(selection.score)
+        or selected.state != ExperimentState.SELECTED
+    ):
+        raise IntegrityError("R-12 smallest safe experiment was not selected")
+    for candidate, decision in zip(ordered_candidates, selection.decisions, strict=True):
+        expected_state = (
+            ExperimentState.SELECTED
+            if candidate.id == selected.id
+            else ExperimentState.ACCEPTED
+            if decision.accepted
+            else ExperimentState.REJECTED
+        )
+        expected_score = decision.score if decision.accepted else None
+        expected_rejection = None if decision.accepted else ",".join(decision.reasons)
+        if (
+            candidate.state != expected_state
+            or candidate.score != expected_score
+            or candidate.rejection_reason != expected_rejection
+        ):
+            raise IntegrityError("R-12 durable candidate lifecycle differs from policy decisions")
+
+    runs = store.list_experiment_runs(case_id)
+    if len(runs) != 1 or runs[0].candidate_id != selected.id:
+        raise IntegrityError("R-13 durable experiment run differs from R-12 selection")
+    run = runs[0]
+    environment = run_proof.get("environment")
+    expected_environment = dict(EXPERIMENT_ENVIRONMENT)
+    expected_environment_digest = canonical_digest(expected_environment)
+    sandbox = run_proof.get("sandbox")
+    expected_sandbox_fields = {
+        "backend",
+        "executable",
+        "executable_sha256",
+        "executable_artifact_digest",
+        "profile_sha256",
+        "logical_argv",
+        "supervisor_argv",
+        "environment",
+        "environment_digest",
+        "process_executables",
+        "read_subpaths",
+        "read_literals",
+        "dynamic_libraries",
+        "python_invocation_path",
+        "python_resolved_path",
+        "python_sha256",
+        "python_artifact_digest",
+    }
+    if not isinstance(sandbox, Mapping) or set(sandbox) != expected_sandbox_fields:
+        raise IntegrityError("R-13 sandbox record is malformed")
+    process_executables_raw = sandbox.get("process_executables")
+    read_subpaths_raw = sandbox.get("read_subpaths")
+    read_literals_raw = sandbox.get("read_literals")
+    dynamic_libraries_raw = sandbox.get("dynamic_libraries")
+    if (
+        not isinstance(process_executables_raw, list)
+        or not process_executables_raw
+        or not isinstance(read_subpaths_raw, list)
+        or not read_subpaths_raw
+        or not isinstance(read_literals_raw, list)
+        or not read_literals_raw
+        or any(
+            not isinstance(item, str) or not Path(item).is_absolute()
+            for item in (*process_executables_raw, *read_subpaths_raw, *read_literals_raw)
+        )
+        or process_executables_raw != sorted(set(process_executables_raw))
+        or read_subpaths_raw != sorted(set(read_subpaths_raw))
+        or read_literals_raw != sorted(set(read_literals_raw))
+        or experiment_cwd_raw not in read_subpaths_raw
+        or not isinstance(dynamic_libraries_raw, list)
+        or any(not isinstance(item, Mapping) for item in dynamic_libraries_raw)
+    ):
+        raise IntegrityError("R-13 sandbox allow-only policy is incomplete")
+    for dependency in dynamic_libraries_raw:
+        if set(dependency) != {"path", "resolved_path", "sha256", "artifact_digest"}:
+            raise IntegrityError("R-13 sandbox loader input is malformed")
+        dependency_path = Path(str(dependency.get("path", "")))
+        dependency_resolved = Path(str(dependency.get("resolved_path", "")))
+        dependency_bytes = _proof_object_bytes(
+            root,
+            dependency.get("artifact_digest"),
+            label="sandbox loader input",
+        )
+        if (
+            not dependency_path.is_absolute()
+            or not dependency_resolved.is_absolute()
+            or sha256_digest(dependency_bytes) != dependency.get("sha256")
+            or str(dependency_path) not in read_literals_raw
+            or str(dependency_resolved) not in read_literals_raw
+        ):
+            raise IntegrityError("R-13 sandbox loader input changed or is not allowed")
+    profile = render_macos_profile(
+        process_executables=tuple(process_executables_raw),
+        read_subpaths=tuple(read_subpaths_raw),
+        read_literals=tuple(read_literals_raw),
+    )
+    profile_path = _relative_proof_file(
+        root,
+        run_proof.get("sandbox_profile_path"),
+        label="sandbox profile",
+    )
+    profile_sha256 = sha256_digest(profile.encode("utf-8"))
+    sandbox_executable = Path(str(sandbox.get("executable", ""))).expanduser()
+    sandbox_executable_bytes = _proof_object_bytes(
+        root,
+        sandbox.get("executable_artifact_digest"),
+        label="sandbox executable",
+    )
+    python_executable_bytes = _proof_object_bytes(
+        root,
+        sandbox.get("python_artifact_digest"),
+        label="Python executable",
+    )
+    if (
+        sandbox.get("backend") != SANDBOX_BACKEND
+        or sandbox_executable != Path("/usr/bin/sandbox-exec")
+        or sandbox.get("executable_sha256")
+        != sha256_digest(sandbox_executable_bytes)
+        or profile_path.read_text(encoding="utf-8") != profile
+        or sandbox.get("profile_sha256") != profile_sha256
+        or run_proof.get("sandbox_profile_sha256") != profile_sha256
+        or process_executables_raw
+        != sorted({selected.argv[0], str(sandbox.get("python_resolved_path"))})
+        or sandbox.get("logical_argv") != list(selected.argv)
+        or sandbox.get("environment") != expected_environment
+        or sandbox.get("environment_digest") != expected_environment_digest
+        or sandbox.get("python_invocation_path") != selected.argv[0]
+        or not Path(str(sandbox.get("python_resolved_path", ""))).is_absolute()
+        or sandbox.get("python_sha256") != sha256_digest(python_executable_bytes)
+    ):
+        raise IntegrityError("R-13 sandbox policy does not bind the selected experiment")
+    expected_supervisor_argv = [
+        str(sandbox_executable),
+        "-p",
+        profile,
+        "--",
+        *selected.argv,
+    ]
+    if (
+        sandbox.get("supervisor_argv") != expected_supervisor_argv
+        or run_proof.get("supervisor_argv") != expected_supervisor_argv
+    ):
+        raise IntegrityError("R-13 sandbox supervisor argv is not exact")
+
+    pre_manifest_path = _relative_proof_file(
+        root,
+        run_proof.get("worktree_pre_manifest_path"),
+        label="pre-experiment worktree manifest",
+    )
+    post_manifest_path = _relative_proof_file(
+        root,
+        run_proof.get("worktree_post_manifest_path"),
+        label="post-experiment worktree manifest",
+    )
+    pre_manifest = _load_object(pre_manifest_path)
+    post_manifest = _load_object(post_manifest_path)
+    for worktree_manifest in (pre_manifest, post_manifest):
+        claimed_digest = worktree_manifest.get("canonical_digest")
+        unsigned_manifest = dict(worktree_manifest)
+        unsigned_manifest.pop("canonical_digest", None)
+        if (
+            worktree_manifest.get("protocol") != "tars.experiment-worktree/v1"
+            or worktree_manifest.get("root") != experiment_cwd_raw
+            or claimed_digest != canonical_digest(unsigned_manifest)
+        ):
+            raise IntegrityError("R-13 worktree manifest is malformed")
+    if (
+        pre_manifest != post_manifest
+        or run_proof.get("workspace_unchanged") is not True
+        or run_proof.get("worktree_pre_digest") != pre_manifest.get("canonical_digest")
+        or run_proof.get("worktree_post_digest") != post_manifest.get("canonical_digest")
+    ):
+        raise IntegrityError("R-13 decisive experiment changed its read-only worktree")
+
+    quarantine = receipt.get("quarantine")
+    if not isinstance(quarantine, Mapping):
+        raise IntegrityError("R-13 quarantine receipt is missing")
+    invalid_commit = str(quarantine.get("invalid_commit", ""))
+    repository = _receipt_git_path(
+        root,
+        quarantine.get("repository"),
+        label="decisive experiment repository",
+        portable_required=False,
+    )
+    if _git(repository, "rev-parse", f"{invalid_commit}^{{commit}}") != invalid_commit:
+        raise IntegrityError("R-13 invalid commit is absent from the proof repository")
+    invalid_tree = _git(repository, "show", "-s", "--format=%T", invalid_commit)
+    manifest_entries = pre_manifest.get("entries")
+    if not isinstance(manifest_entries, list) or any(
+        not isinstance(item, Mapping) for item in manifest_entries
+    ):
+        raise IntegrityError("R-13 worktree manifest entries are malformed")
+    manifest_by_path = {
+        str(item.get("path", "")): dict(item)
+        for item in manifest_entries
+        if item.get("path") != ".git"
+    }
+    if (
+        len(manifest_by_path) != len(manifest_entries) - 1
+        or ".git" not in {str(item.get("path", "")) for item in manifest_entries}
+        or manifest_by_path != _git_worktree_manifest(repository, invalid_commit)
+    ):
+        raise IntegrityError("R-13 experiment worktree differs from the quarantined Git tree")
+
+    if (
+        run.state != ExperimentState.PASSED
+        or run.exit_code != 0
+        or run.environment_digest != expected_environment_digest
+        or environment != expected_environment
+        or run_proof.get("environment_digest") != expected_environment_digest
+        or run_proof.get("experiment_run") != run.model_dump(mode="json")
+        or run_proof.get("argv") != list(selected.argv)
+        or run_proof.get("argv") != run.metadata.get("argv")
+        or run.metadata.get("supervisor_argv") != expected_supervisor_argv
+        or run.metadata.get("sandbox") != dict(sandbox)
+        or run.metadata.get("environment") != expected_environment
+        or run.metadata.get("commit") != invalid_commit
+        or run.metadata.get("tree") != invalid_tree
+        or run.metadata.get("worktree_pre_digest") != pre_manifest.get("canonical_digest")
+        or run_proof.get("commit") != invalid_commit
+        or run_proof.get("tree") != invalid_tree
+        or run.metadata.get("selection_score") != list(selection.score)
+        or run_proof.get("exit_code") != run.exit_code
+        or run_proof.get("stdout_artifact_digest") != run.stdout_artifact_digest
+        or run_proof.get("stderr_artifact_digest") != run.stderr_artifact_digest
+        or run_proof.get("observed_outcome") != run.observed_outcome
+    ):
+        raise IntegrityError("R-13 run proof differs from durable execution")
+    output_bytes: dict[str, bytes] = {}
+    for label, digest in (
+        ("stdout", run.stdout_artifact_digest),
+        ("stderr", run.stderr_artifact_digest),
+    ):
+        if not isinstance(digest, str):
+            raise IntegrityError("R-13 experiment output digest is missing")
+        object_path = root / "objects" / digest[:2] / digest[2:]
+        if (
+            not object_path.is_file()
+            or object_path.is_symlink()
+            or sha256_digest(object_path.read_bytes()) != digest
+        ):
+            raise IntegrityError("R-13 experiment output artifact is missing or changed")
+        output_bytes[label] = object_path.read_bytes()
+    try:
+        captured_outcome = json.loads(output_bytes["stdout"])
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError("R-13 decisive experiment stdout is not JSON") from exc
+    if captured_outcome != run.observed_outcome:
+        raise IntegrityError("R-13 observed outcome differs from captured stdout")
+    resolved_hypotheses = matching_hypotheses(dict(selected.predictions), captured_outcome)
+    if (
+        resolved_hypotheses != (HYPOTHESES[0],)
+        or run_proof.get("resolved_hypothesis_id") != HYPOTHESES[0]
+        or run_proof.get("evidence_hypothesis_id") != HYPOTHESES[1]
+        or run_proof.get("disagreement_confirmed") is not True
+    ):
+        raise IntegrityError("R-13 outcome does not prove the implementation/evidence disagreement")
+
+    action = store.get_action(run.action_id) if run.action_id is not None else None
+    effect_id = run.metadata.get("effect_id")
+    effect = store.get_effect(effect_id) if isinstance(effect_id, str) else None
+    warrant = store.get_warrant(action.warrant_id) if action is not None else None
+    expected_payload = {
+        "case_id": case_id,
+        "candidate_id": selected.id,
+        "argv": list(selected.argv),
+        "cwd": experiment_cwd_raw,
+        "commit": invalid_commit,
+        "tree": invalid_tree,
+        "environment": expected_environment,
+        "environment_digest": expected_environment_digest,
+        "sandbox": dict(sandbox),
+    }
+    expected_effect_metadata = {
+        "case_id": case_id,
+        "candidate_id": selected.id,
+        "argv": list(selected.argv),
+        "cwd": experiment_cwd_raw,
+        "commit": invalid_commit,
+        "tree": invalid_tree,
+        "environment": expected_environment,
+        "environment_digest": expected_environment_digest,
+        "sandbox": dict(sandbox),
+        "worktree_pre_digest": pre_manifest.get("canonical_digest"),
+    }
+    effect_observation = {
+        "exit_code": run.exit_code,
+        "stdout_artifact_digest": run.stdout_artifact_digest,
+        "stderr_artifact_digest": run.stderr_artifact_digest,
+        "observed_outcome": run.observed_outcome,
+        "sandbox_profile_sha256": profile_sha256,
+        "environment_digest": expected_environment_digest,
+        "worktree_pre_digest": pre_manifest.get("canonical_digest"),
+        "worktree_post_digest": post_manifest.get("canonical_digest"),
+        "workspace_unchanged": True,
+    }
+    command_target_digest = canonical_digest(
+        {"cwd": experiment_cwd_raw, "argv": list(selected.argv)}
+    )
+    expected_command_target = f"command:{command_target_digest}"
+    expected_warrant_bindings = {
+        "command:argv": canonical_digest(list(selected.argv)),
+        "command:cwd": canonical_digest(experiment_cwd_raw),
+        "command:executable": str(sandbox.get("python_sha256")),
+        "git:commit-oid": sha256_digest(invalid_commit),
+        "git:tree-oid": sha256_digest(invalid_tree),
+        "sandbox:executable": str(sandbox.get("executable_sha256")),
+        "sandbox:profile": profile_sha256,
+        "sandbox:environment": expected_environment_digest,
+        "sandbox:supervisor-argv": canonical_digest(expected_supervisor_argv),
+        "sandbox:worktree-pre": str(pre_manifest.get("canonical_digest")),
+        "python:resolved-executable": str(sandbox.get("python_sha256")),
+    }
+    if (
+        action is None
+        or effect is None
+        or warrant is None
+        or effect.action_id != action.id
+        or action.target != expected_command_target
+        or action.payload_digest != canonical_digest(expected_payload)
+        or any(effect.metadata.get(key) != value for key, value in expected_effect_metadata.items())
+        or dict(action.artifact_vector) != dict(warrant.artifact_hashes)
+        or any(
+            warrant.artifact_hashes.get(key) != value
+            for key, value in expected_warrant_bindings.items()
+        )
+        or effect.before_hash != canonical_digest(dict(warrant.artifact_hashes))
+        or effect.state != EffectState.EXECUTED
+        or effect.after_hash != canonical_digest(effect_observation)
+        or not isinstance(effect.forward_artifact_digest, str)
+    ):
+        raise IntegrityError("R-13 execution is not bound to its authorized action and effect")
+    effect_object = (
+        root
+        / "objects"
+        / effect.forward_artifact_digest[:2]
+        / effect.forward_artifact_digest[2:]
+    )
+    if (
+        not effect_object.is_file()
+        or effect_object.is_symlink()
+        or effect_object.read_bytes() != canonical_json(effect_observation).encode("utf-8")
+        or sha256_digest(effect_object.read_bytes()) != effect.forward_artifact_digest
+    ):
+        raise IntegrityError("R-13 execution effect artifact is missing or changed")
+    receipt_experiment = receipt.get("experiment")
+    if not isinstance(receipt_experiment, Mapping) or (
+        receipt_experiment.get("candidate_count") != len(ordered_candidates)
+        or receipt_experiment.get("selected_candidate_id") != selected.id
+        or receipt_experiment.get("selected_score") != list(selection.score)
+        or receipt_experiment.get("argv") != list(selected.argv)
+        or receipt_experiment.get("exit_code") != run.exit_code
+        or receipt_experiment.get("stdout_artifact_digest") != run.stdout_artifact_digest
+        or receipt_experiment.get("stderr_artifact_digest") != run.stderr_artifact_digest
+        or receipt_experiment.get("observed_outcome") != run.observed_outcome
+        or receipt_experiment.get("environment") != expected_environment
+        or receipt_experiment.get("environment_digest") != expected_environment_digest
+        or receipt_experiment.get("sandbox") != dict(sandbox)
+        or receipt_experiment.get("commit") != invalid_commit
+        or receipt_experiment.get("tree") != invalid_tree
+        or receipt_experiment.get("workspace_unchanged") is not True
+        or receipt_experiment.get("resolved_hypothesis_id") != HYPOTHESES[0]
+        or receipt_experiment.get("evidence_hypothesis_id") != HYPOTHESES[1]
+        or receipt_experiment.get("disagreement_confirmed") is not True
+    ):
+        raise IntegrityError("receipt experiment proof differs from R-12/R-13 evidence")
+    return True
+
+
 def verify_bundle(
     artifact_root: str | Path,
     *,
@@ -650,6 +1210,13 @@ def verify_bundle(
         store=store,
         receipt=receipt,
         run_id=run_id,
+        case_id=case_id,
+    )
+    decisive_experiment = _verify_decisive_experiment(
+        root,
+        manifest,
+        store=store,
+        receipt=receipt,
         case_id=case_id,
     )
 
@@ -819,6 +1386,7 @@ def verify_bundle(
         "unrelated_agent_pushed": True,
         "replacement_pushed": True,
         "complete_gateway_authorization_coverage": authorization_coverage,
+        "smallest_decisive_experiment": decisive_experiment,
         "durable_canonical_receipt": canonical_bound,
     }
     if "R-01" in required:

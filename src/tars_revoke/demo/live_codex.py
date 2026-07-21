@@ -30,6 +30,11 @@ from tars_revoke.adapters.processes import AsyncProcessRunner, ProcessResult
 from tars_revoke.errors import AuthorizationError, IntegrityError, ValidationError
 from tars_revoke.services.repair import RevocationPacket
 
+from .experiment_contract import (
+    CANONICAL_EXPERIMENT_SPECS,
+    HYPOTHESES,
+    canonical_experiment_spec,
+)
 from .fixture import DemoFixture
 from .migration_contract import (
     MIGRATION_SOURCE_PATH,
@@ -49,29 +54,7 @@ _SHELLS = {
     "sh",
     "zsh",
 }
-_HYPOTHESES = ("contract_v1_uuid", "contract_v2_opaque")
 _MAX_EXPERIMENT_CORRECTION_TURNS = 2
-_OBSERVER_V2_CODE = (
-    "import json; from pathlib import Path; "
-    "from scripts.contract_probe import probe; "
-    "print(json.dumps(probe(Path('examples/customer-v2.json')), sort_keys=True))"
-)
-_PROBE_CLI_TAILS = {
-    (
-        "scripts/contract_probe.py",
-        "--example",
-        "examples/customer-v1.json",
-        "--expect",
-        "accept",
-    ),
-    (
-        "scripts/contract_probe.py",
-        "--example",
-        "examples/customer-v2.json",
-        "--expect",
-        "reject",
-    ),
-}
 
 
 class _ModelDump(Protocol):
@@ -103,25 +86,29 @@ def _pretty_json(value: object) -> str:
 
 
 def _experiment_command_grammar() -> str:
-    observer_argv = ("python", "-B", "-c", _OBSERVER_V2_CODE)
-    cli_argv = tuple(("python", "-B", *tail) for tail in sorted(_PROBE_CLI_TAILS))
+    exact_candidates = [
+        {
+            "name": spec.name,
+            "argv": list(spec.portable_argv),
+            "predictions": spec.prediction_map,
+            "estimated_runtime_ms": spec.estimated_runtime_ms,
+        }
+        for spec in CANONICAL_EXPERIMENT_SPECS
+    ]
     return f"""Process success and hypothesis outcome are separate. An accepted or rejected
 customer is an observed JSON value and must still exit 0. A nonzero process exit means
 the experiment infrastructure broke. Never use pytest failure or a probe mismatch as a
 hypothesis observation.
 
-Every argv must use exactly one of these canonical grammars:
-1. JSON observer (Path is required and the import syntax is exact):
-{_pretty_json(observer_argv)}
-The only permitted alternate fixture is examples/customer-v1.json. The observer must
-contain exactly one approved Path literal and must not call exit, raise, subprocess,
-os.system, or a shell.
-2. Exact fixture CLI for the known quarantined v1 implementation:
-{_pretty_json(cli_argv[0])}
-{_pretty_json(cli_argv[1])}
+Return each of these three observer specifications exactly once. Copy each argv,
+predictions object, and estimated_runtime_ms byte-for-byte; choose a unique safe ID for
+each. Predictions are canonical JSON strings and the runtime will require captured stdout
+to match exactly one hypothesis:
+{_pretty_json(exact_candidates)}
 
-Bare Python argv, malformed imports such as `from pathlib import import Path`, pytest,
-positional contract_probe arguments, and any other command grammar are forbidden."""
+Use hypotheses={_pretty_json(HYPOTHESES)}, touched_files=[], risk="low", and
+command_count=1. Bare Python argv, modified observer code, pytest, contract_probe CLI,
+shells, duplicate commands, extra fields, and any other command grammar are forbidden."""
 
 
 def _evidence_mapping(value: Mapping[str, Any] | _ModelDump) -> Mapping[str, Any]:
@@ -163,46 +150,10 @@ def _normalize_argv(argv: Sequence[str]) -> tuple[str, ...]:
 def _validate_observational_experiment_argv(argv: tuple[str, ...]) -> None:
     """Require domain outcomes to be JSON data, never process failure."""
 
-    if not Path(argv[0]).name.lower().startswith("python") or len(argv) < 3:
+    if argv[0] != "python":
         raise CodexProtocolError("experiment must use the bounded Python probe")
-    if argv[1] != "-B":
-        raise CodexProtocolError("experiment Python must disable bytecode writes")
-    tail = argv[2:]
-    if tail in _PROBE_CLI_TAILS:
-        return
-    if tail[0] != "-c" or len(tail) != 2:
-        raise CodexProtocolError("experiment uses an invalid contract_probe argv shape")
-    observer = tail[1]
-    required_fragments = (
-        "from pathlib import Path",
-        "scripts.contract_probe",
-        "probe(",
-        "json.dumps",
-        "print(",
-    )
-    if any(fragment not in observer for fragment in required_fragments):
-        raise CodexProtocolError("experiment observer does not emit the probe result as JSON")
-    path_literals = re.findall(r"Path\(\s*(['\"])([^'\"]+)\1\s*\)", observer)
-    approved_examples = {"examples/customer-v1.json", "examples/customer-v2.json"}
-    if (
-        len(path_literals) != 1
-        or observer.count("Path(") != 1
-        or path_literals[0][1] not in approved_examples
-    ):
-        raise CodexProtocolError(
-            "experiment observer must pass exactly one approved pathlib.Path fixture"
-        )
-    forbidden_fragments = (
-        "SystemExit",
-        "exit(",
-        "os.system",
-        "raise ",
-        "shell=True",
-        "subprocess",
-        "sys.exit",
-    )
-    if any(fragment in observer for fragment in forbidden_fragments):
-        raise CodexProtocolError("experiment observer can convert a domain outcome to failure")
+    if canonical_experiment_spec(argv) is None:
+        raise CodexProtocolError("experiment does not match an exact canonical observer")
 
 
 def _sha256(payload: bytes) -> str:
@@ -354,6 +305,113 @@ class ExperimentProposalResult:
         return max(0, len(self.attempts) - 1)
 
 
+def validate_live_experiment_candidate(value: object) -> LiveExperimentCandidate:
+    """Apply the exact runtime policy to one Codex experiment proposal."""
+
+    if not isinstance(value, Mapping):
+        raise CodexProtocolError("experiment candidate is not an object")
+    expected_fields = {
+        "id",
+        "hypotheses",
+        "predictions",
+        "argv",
+        "touched_files",
+        "risk",
+        "estimated_runtime_ms",
+        "command_count",
+    }
+    if set(value) != expected_fields:
+        raise CodexProtocolError("experiment candidate has unexpected fields")
+    candidate_id_raw = value["id"]
+    hypotheses_raw = value["hypotheses"]
+    predictions_raw = value["predictions"]
+    argv_raw = value["argv"]
+    touched_raw = value["touched_files"]
+    risk_raw = value["risk"]
+    runtime_raw = value["estimated_runtime_ms"]
+    command_count_raw = value["command_count"]
+    if (
+        not isinstance(candidate_id_raw, str)
+        or not isinstance(hypotheses_raw, list)
+        or any(not isinstance(item, str) or not item for item in hypotheses_raw)
+        or not isinstance(predictions_raw, Mapping)
+        or any(
+            not isinstance(key, str) or not isinstance(item, str)
+            for key, item in predictions_raw.items()
+        )
+        or not isinstance(argv_raw, list)
+        or any(not isinstance(item, str) or not item for item in argv_raw)
+        or not isinstance(touched_raw, list)
+        or any(not isinstance(item, str) or not item for item in touched_raw)
+        or not isinstance(risk_raw, str)
+        or type(runtime_raw) is not int
+        or type(command_count_raw) is not int
+    ):
+        raise CodexProtocolError("invalid structured experiment candidate")
+    candidate_id = candidate_id_raw
+    hypotheses = tuple(hypotheses_raw)
+    predictions = dict(predictions_raw)
+    try:
+        argv = _normalize_argv(tuple(argv_raw))
+        touched = tuple(_safe_relative_path(item) for item in touched_raw)
+    except ValidationError as exc:
+        raise CodexProtocolError("invalid structured experiment candidate") from exc
+    risk = risk_raw
+    runtime = runtime_raw
+    command_count = command_count_raw
+    if not _SAFE_ID.fullmatch(candidate_id):
+        raise CodexProtocolError("experiment candidate has an invalid ID")
+    if tuple(dict.fromkeys(hypotheses)) != HYPOTHESES:
+        raise CodexProtocolError("experiment candidate changed the live hypothesis set")
+    if set(predictions) != set(HYPOTHESES):
+        raise CodexProtocolError("experiment predictions do not cover both hypotheses")
+    if Path(argv[0]).name.lower() in _SHELLS:
+        raise CodexProtocolError("experiment candidate invokes a shell")
+    _validate_observational_experiment_argv(argv)
+    spec = canonical_experiment_spec(argv)
+    if spec is None:
+        raise CodexProtocolError("experiment does not match an exact canonical observer")
+    if predictions != spec.prediction_map:
+        raise CodexProtocolError("experiment predictions differ from the canonical observer")
+    if touched:
+        raise CodexProtocolError("observational experiment declared touched files")
+    if risk != "low" or runtime != spec.estimated_runtime_ms or command_count != 1:
+        raise CodexProtocolError("experiment candidate exceeds the bounded policy")
+    return LiveExperimentCandidate(
+        id=candidate_id,
+        hypotheses=hypotheses,
+        predictions=predictions,
+        argv=argv,
+        touched_files=touched,
+        risk=risk,
+        estimated_runtime_ms=runtime,
+        command_count=command_count,
+    )
+
+
+def validate_live_experiment_proposal(
+    output: Mapping[str, Any],
+) -> tuple[LiveExperimentCandidate, ...]:
+    """Recompute the complete live proposal policy, including unique IDs."""
+
+    if set(output) != {"candidates"}:
+        raise CodexProtocolError("Codex experiment proposal has unexpected fields")
+    raw_candidates = output.get("candidates")
+    if not isinstance(raw_candidates, list) or len(raw_candidates) != len(
+        CANONICAL_EXPERIMENT_SPECS
+    ):
+        raise CodexProtocolError("Codex must return exactly three experiment candidates")
+    candidates = tuple(validate_live_experiment_candidate(item) for item in raw_candidates)
+    ids = [candidate.id for candidate in candidates]
+    if len(ids) != len(set(ids)):
+        raise CodexProtocolError("Codex returned duplicate experiment candidate IDs")
+    if {candidate.argv for candidate in candidates} != {
+        spec.portable_argv for spec in CANONICAL_EXPERIMENT_SPECS
+    }:
+        raise CodexProtocolError("Codex did not return every canonical observer exactly once")
+    return candidates
+
+
 @dataclass(frozen=True)
 class _GitSnapshot:
     head: str
@@ -438,7 +496,7 @@ _EXPERIMENT_SCHEMA: Mapping[str, Any] = {
         "candidates": {
             "type": "array",
             "minItems": 3,
-            "maxItems": 5,
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "properties": {
@@ -451,10 +509,13 @@ _EXPERIMENT_SCHEMA: Mapping[str, Any] = {
                     "predictions": {
                         "type": "object",
                         "properties": {
-                            "contract_v1_uuid": {"type": "string"},
-                            "contract_v2_opaque": {"type": "string"},
+                            "implementation_rejects_signed_v2": {"type": "string"},
+                            "implementation_accepts_signed_v2": {"type": "string"},
                         },
-                        "required": ["contract_v1_uuid", "contract_v2_opaque"],
+                        "required": [
+                            "implementation_rejects_signed_v2",
+                            "implementation_accepts_signed_v2",
+                        ],
                         "additionalProperties": False,
                     },
                     "argv": {
@@ -466,7 +527,7 @@ _EXPERIMENT_SCHEMA: Mapping[str, Any] = {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                     },
-                    "risk": {"type": "string", "enum": ["low", "medium"]},
+                    "risk": {"type": "string", "enum": ["low"]},
                     "estimated_runtime_ms": {"type": "integer", "minimum": 1},
                     "command_count": {"type": "integer", "minimum": 1},
                 },
@@ -794,16 +855,16 @@ changed_paths exactly match the paths actually changed on disk."""
         case_id: str,
         analysis: ContradictionAnalysis,
     ) -> str:
-        return f"""Continue as Agent B. Propose 3 to 5 bounded, read-only experiments for
+        return f"""Continue as Agent B. Propose exactly 3 bounded, read-only experiments for
 revocation case {case_id}. Do not modify the repository.
 
 Verified contradiction analysis:
 {_pretty_json(analysis.as_mapping())}
 
-Every candidate must distinguish exactly these hypotheses: {_pretty_json(_HYPOTHESES)}.
-Predictions must differ between hypotheses. Each candidate is one argv command, uses only
-repository-local fixtures and existing Python, requires no network or mutation, declares
-touched_files=[], risk="low", command_count=1, and a realistic positive runtime estimate.
+Every candidate must distinguish exactly these hypotheses: {_pretty_json(HYPOTHESES)}.
+Predictions and runtime estimates must exactly match the canonical specifications below.
+Each candidate is one argv command, uses only repository-local fixtures and existing Python,
+requires no network or mutation, and declares touched_files=[], risk="low", command_count=1.
 
 {_experiment_command_grammar()}
 
@@ -827,28 +888,22 @@ Exact validation error:
 Prior invalid structured output, for diagnosis only:
 {_pretty_json(invalid_output)}
 
-Return a complete replacement object with 3 to 5 candidates. Do not defend, patch, or
+Return a complete replacement object with exactly 3 candidates. Do not defend, patch, or
 partially amend the prior output. Do not invent another command grammar.
 
 {_experiment_command_grammar()}
 
-All other candidate constraints remain unchanged: exact hypothesis IDs, discriminating
-string predictions, touched_files=[], risk="low", command_count=1, no mutation, and a
-positive runtime estimate. Return only the corrected structured object."""
+All other candidate constraints remain unchanged: exact hypothesis IDs, canonical string
+predictions and runtime estimates, touched_files=[], risk="low", command_count=1, and no
+mutation. Return only the corrected structured object."""
 
     @classmethod
     def _proposal_candidates(
         cls,
         output: Mapping[str, Any],
     ) -> tuple[LiveExperimentCandidate, ...]:
-        raw_candidates = output.get("candidates")
-        if not isinstance(raw_candidates, list) or len(raw_candidates) < 3:
-            raise CodexProtocolError("Codex returned fewer than three experiment candidates")
-        candidates = tuple(cls._experiment_candidate(item) for item in raw_candidates)
-        ids = [candidate.id for candidate in candidates]
-        if len(ids) != len(set(ids)):
-            raise CodexProtocolError("Codex returned duplicate experiment candidate IDs")
-        return candidates
+        del cls
+        return validate_live_experiment_proposal(output)
 
     async def repair(
         self,
@@ -919,47 +974,7 @@ Rules:
 
     @staticmethod
     def _experiment_candidate(value: object) -> LiveExperimentCandidate:
-        if not isinstance(value, Mapping):
-            raise CodexProtocolError("experiment candidate is not an object")
-        try:
-            candidate_id = str(value["id"])
-            hypotheses = tuple(str(item) for item in value["hypotheses"])
-            predictions_raw = value["predictions"]
-            argv = _normalize_argv(tuple(str(item) for item in value["argv"]))
-            touched = tuple(_safe_relative_path(str(item)) for item in value["touched_files"])
-            risk = str(value["risk"])
-            runtime = int(value["estimated_runtime_ms"])
-            command_count = int(value["command_count"])
-        except (KeyError, TypeError, ValueError, ValidationError) as exc:
-            raise CodexProtocolError("invalid structured experiment candidate") from exc
-        if not _SAFE_ID.fullmatch(candidate_id):
-            raise CodexProtocolError("experiment candidate has an invalid ID")
-        if tuple(dict.fromkeys(hypotheses)) != _HYPOTHESES:
-            raise CodexProtocolError("experiment candidate changed the live hypothesis set")
-        if not isinstance(predictions_raw, Mapping):
-            raise CodexProtocolError("experiment predictions must be an object")
-        predictions = dict(predictions_raw)
-        if set(predictions) != set(_HYPOTHESES):
-            raise CodexProtocolError("experiment predictions do not cover both hypotheses")
-        if len({_pretty_json(predictions[item]) for item in _HYPOTHESES}) < 2:
-            raise CodexProtocolError("experiment candidate is not discriminating")
-        if Path(argv[0]).name.lower() in _SHELLS:
-            raise CodexProtocolError("experiment candidate invokes a shell")
-        _validate_observational_experiment_argv(argv)
-        if touched:
-            raise CodexProtocolError("observational experiment declared touched files")
-        if risk != "low" or runtime <= 0 or command_count != 1:
-            raise CodexProtocolError("experiment candidate exceeds the bounded policy")
-        return LiveExperimentCandidate(
-            id=candidate_id,
-            hypotheses=hypotheses,
-            predictions=predictions,
-            argv=argv,
-            touched_files=touched,
-            risk=risk,
-            estimated_runtime_ms=runtime,
-            command_count=command_count,
-        )
+        return validate_live_experiment_candidate(value)
 
     async def _execute_stage(
         self,

@@ -4,7 +4,15 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from tars_revoke.errors import ValidationError
 
@@ -40,6 +48,7 @@ from .enums import (
 )
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
+CommandArg = Annotated[str, StringConstraints(min_length=1, strip_whitespace=False)]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Probability = Annotated[float, Field(ge=0.0, le=1.0)]
 
@@ -421,7 +430,7 @@ class ExperimentCandidate(DomainModel):
     case_id: NonEmptyStr
     hypotheses: tuple[str, ...]
     predictions: Mapping[str, Any]
-    argv: tuple[str, ...]
+    argv: tuple[CommandArg, ...]
     fixture_refs: tuple[str, ...] = ()
     touched_files: tuple[str, ...] = ()
     risk: RiskLevel
@@ -467,7 +476,7 @@ class TestRun(DomainModel):
     case_id: str | None = None
     action_id: str | None = None
     kind: TestKind
-    argv: tuple[str, ...]
+    argv: tuple[CommandArg, ...]
     state: TestState = TestState.PENDING
     started_at: AwareDatetime
     finished_at: AwareDatetime | None = None
