@@ -207,7 +207,7 @@ def _portable_copy_bundle(source: Path, destination: Path) -> None:
     rewritten["resume"] = resume
     _rewrite_live_attempt_paths(rewritten, source)
 
-    requirements = _manifest_path_map(manifest)
+    requirements = _manifest_path_map(destination, manifest)
     requirements.setdefault("R-17", []).append(destination / "state.sqlite")
     repository_files = _regular_tree_files(repository)
     remote_files = _regular_tree_files(remote)
@@ -266,9 +266,21 @@ def _copy_bundle_files(source: Path, destination: Path) -> None:
 def _backup_database(source: Path, destination: Path) -> None:
     if not source.is_file() or source.is_symlink():
         raise IntegrityError(f"state database is missing or unsafe: {source}")
+    wal = source.with_name(f"{source.name}-wal")
+    if wal.exists() and (wal.is_symlink() or not wal.is_file() or wal.stat().st_size):
+        raise IntegrityError(
+            f"state database has an uncheckpointed or unsafe WAL sidecar: {wal}"
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        source_connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        # A copied database can retain WAL mode in its header.  Opening it with
+        # regular read-only mode makes SQLite create a transient -shm sidecar,
+        # so a second portable snapshot can fail.  A zero-length WAL is checked
+        # above; immutable mode then gives us a truly read-only base snapshot.
+        source_connection = sqlite3.connect(
+            f"{source.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
         destination_connection = sqlite3.connect(destination)
         try:
             source_connection.backup(destination_connection)
@@ -412,7 +424,7 @@ def _copy_qualification_evidence(
     target_root = destination / "release-evidence" / "r20" / "qualification"
     target_root.mkdir(parents=True, exist_ok=True)
     bundle_roots = set(source_qualification.bundle_roots)
-    for path in _walk_regular_files(source_root):
+    for path in _walk_regular_files(source_root, excluded_top_level={"gate-home"}):
         if any(bundle == path or bundle in path.parents for bundle in bundle_roots):
             continue
         payload = path.read_bytes()
@@ -550,13 +562,12 @@ def _attest_release_root(
 ) -> BundleVerification:
     receipt = _load_object(root / "portable-receipt.json")
     manifest = _load_object(root / "portable-proof-manifest.json")
-    requirements = _manifest_path_map(manifest)
+    requirements = _manifest_path_map(root, manifest)
     requirements["R-18"] = list(crash_paths)
     requirements["R-19"] = list(benchmark_paths)
     requirements["R-20"] = [ledger_path, *_regular_tree_files(qualification_root)]
 
     rewritten = dict(receipt)
-    rewritten.pop("integrity", None)
     rewritten["proof_scope"] = list(DEFAULT_REQUIREMENT_IDS)
     verification = _mapping_copy(rewritten.get("verification"), "verification")
     verification["proof_scope"] = list(DEFAULT_REQUIREMENT_IDS)
@@ -729,7 +740,7 @@ def _register_attestation_receipt(
     )
 
 
-def _manifest_path_map(manifest: Mapping[str, Any]) -> dict[str, list[Path]]:
+def _manifest_path_map(root: Path, manifest: Mapping[str, Any]) -> dict[str, list[Path]]:
     requirements = manifest.get("requirements")
     if not isinstance(requirements, Mapping):
         raise IntegrityError("proof manifest requirements are missing")
@@ -741,7 +752,11 @@ def _manifest_path_map(manifest: Mapping[str, Any]) -> dict[str, list[Path]]:
         for entry in entries:
             if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str):
                 raise IntegrityError("proof manifest entry is malformed")
-            paths.append(Path(str(entry["path"])))
+            relative = Path(str(entry["path"]))
+            resolved = (root / relative).resolve()
+            if relative.is_absolute() or (resolved != root and root not in resolved.parents):
+                raise IntegrityError("proof manifest path escapes its artifact root")
+            paths.append(resolved)
         result[requirement_id] = paths
     return result
 
@@ -803,9 +818,17 @@ def _live_codex_internal_files(root: Path) -> list[Path]:
     return _regular_tree_files(live_root)
 
 
-def _walk_regular_files(root: Path) -> Iterable[Path]:
+def _walk_regular_files(
+    root: Path,
+    *,
+    excluded_top_level: set[str] | None = None,
+) -> Iterable[Path]:
     root = root.resolve(strict=True)
+    excluded = excluded_top_level or set()
     for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] in excluded:
+            continue
         if path.is_symlink():
             raise IntegrityError(f"proof tree contains a symlink: {path}")
         if path.is_file():

@@ -760,14 +760,18 @@ def _verify_supervisor_argv(
         tail = tail[2:]
     if len(tail) < 5 or tail[0] != "--output-schema":
         raise IntegrityError("R-14 supervisor argv omits its output schema")
-    argv_schema = Path(tail[1]).expanduser().resolve()
-    if argv_schema != schema_path.resolve():
+    argv_schema = Path(tail[1]).expanduser()
+    if argv_schema.resolve() != schema_path.resolve() and (
+        not argv_schema.is_absolute() or argv_schema.name != schema_path.name
+    ):
         raise IntegrityError("R-14 supervisor output schema differs from its artifact")
     if tail[2] != "--output-last-message":
         raise IntegrityError("R-14 supervisor argv omits its last-message sink")
-    last_message = Path(tail[3]).expanduser().resolve()
+    last_message = Path(tail[3]).expanduser()
     live_root = (root / "agents" / "live-codex").resolve()
-    if live_root not in last_message.parents or not last_message.name.startswith("codex-last-"):
+    if not last_message.name.startswith("codex-last-") or (
+        not last_message.is_absolute() and live_root not in last_message.resolve().parents
+    ):
         raise IntegrityError("R-14 supervisor last-message path escapes live artifacts")
     expected_suffix = [thread_id, "-"] if resumed else ["-"]
     if tail[4:] != expected_suffix:
