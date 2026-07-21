@@ -227,6 +227,49 @@ ignored by Git and should be reviewed before sharing.
 
 See [SECURITY.md](SECURITY.md) for boundaries and limitations.
 
+## Built with Codex and GPT-5.6
+
+This project was built with Codex in the ChatGPT desktop app throughout.
+
+**GPT-5.6 Sol** handled architecture design, security threat-modelling, hardening
+passes, clean-clone qualification, and the most difficult implementation work:
+the two-phase effect gateway, typed causal graph, hash-chained event journal,
+signed Git capability protocol, fail-closed Codex adapter, and the complete
+revocation coordinator state machine. Sol also discovered the clean-clone
+packaging defect (editable install tried to ship `web/dist` before the frontend
+build) and the macOS sandbox alias bypass (`/System/Volumes/Data/...` evading a
+simple `/Users` deny), replacing the draft policy with an explicit allow-only
+profile before any live run.
+
+**GPT-5.6 Terra** completed the final testing, portable-attestation packaging
+fixes, and release verification after the Sol usage limit was reached.
+
+The core product decision is mine: an action should remain authorized only while
+its exact assumptions, evidence, and tests remain valid. Codex helped map the
+architecture, implement warrants and causal dependency tracking, build revocation
+and compensation, design the fail-closed live qualification system, and complete
+testing.
+
+The scripted demo (`make demo-scripted`) is an honest deterministic offline
+protocol replay. It is labelled `SCRIPTED` and does not satisfy live Codex
+requirements. It exists so anyone can inspect the full revocation protocol
+without spending credits.
+
+## Release status
+
+| Metric | Result |
+|--------|--------|
+| Offline test suite | 311 passed |
+| Live Codex qualification runs | Exactly 3 successful |
+| Release requirements | R-01 through R-20 verified twice (strict) |
+| Live evidence commit | `8c58251` |
+| Final validated code release | `e58b741` |
+
+Commits after `e58b741` are documentation-only. The live evidence is bound to
+`8c58251`; the two subsequent code commits (`cb18c6c`, `e58b741`) fix offline
+portable-attestation packaging exposed by those real proofs. The final
+attestation validates successfully against the complete release.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
