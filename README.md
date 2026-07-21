@@ -265,7 +265,7 @@ without spending credits.
 | Live evidence commit | `8c58251` |
 | Final validated code release | `e58b741` |
 
-Commits after `e58b741` are documentation-only. The live evidence is bound to
+Commits after `e58b741` do not modify the validated application source; they update documentation and CI configuration. The live evidence is bound to
 `8c58251`; the two subsequent code commits (`cb18c6c`, `e58b741`) fix offline
 portable-attestation packaging exposed by those real proofs. The final
 attestation validates successfully against the complete release.
