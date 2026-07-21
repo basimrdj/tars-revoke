@@ -52,19 +52,42 @@ Scripted mode exercises the complete protocol deterministically and is labelled
 
 ## Quick start
 
-Requirements: Python 3.10+, Git, Node.js/npm, and the Codex CLI for live mode.
+### Judge path — prebuilt wheel
+
+**Supported demo platform: macOS.** The canonical scenario uses Apple's
+`sandbox-exec` for its decisive experiment. Judges need only Python 3.10+ and
+Git for the deterministic scripted proof; it requires no Codex login, API key,
+Node.js/npm, `uv`, or source build.
+
+```bash
+python3 -m venv --copies /tmp/tars-revoke-judge
+source /tmp/tars-revoke-judge/bin/activate
+python -m pip install \
+  https://github.com/basimrdj/tars-revoke/releases/download/v0.1.0/tars_revoke-0.1.0-py3-none-any.whl \
+  'pytest>=9.0.3,<10'
+tars-revoke demo --scenario external-schema-v2 --scripted
+```
+
+The command finishes by independently verifying the generated proof bundle and
+printing its location. Scripted mode demonstrates the complete protocol but is
+clearly labelled and does not count as live-Codex evidence.
+
+### Source checkout
+
+Requirements: macOS, Python 3.10+, Git, Node.js/npm, `uv`, and the Codex CLI
+for live mode.
 Release qualification additionally requires the pinned OpenAI desktop Codex
 binary from `ChatGPT.app` (or legacy `Codex.app`), with exact release bytes,
 bundle ID `com.openai.codex`, and OpenAI team ID `2DC432GLL2`.
 
 ```bash
 make setup
-make doctor
 
 # Fast, deterministic protocol proof
 make demo-scripted
 
-# Real Codex execution; uses your current Codex login or API-key environment
+# Live-only environment check and real Codex execution
+make doctor
 make demo-live
 ```
 
