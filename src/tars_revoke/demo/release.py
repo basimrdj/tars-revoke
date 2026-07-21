@@ -207,7 +207,7 @@ def _portable_copy_bundle(source: Path, destination: Path) -> None:
     rewritten["resume"] = resume
     _rewrite_live_attempt_paths(rewritten, source)
 
-    requirements = _manifest_path_map(destination, manifest)
+    requirements = _manifest_path_map(manifest, root=destination)
     requirements.setdefault("R-17", []).append(destination / "state.sqlite")
     repository_files = _regular_tree_files(repository)
     remote_files = _regular_tree_files(remote)
@@ -562,7 +562,7 @@ def _attest_release_root(
 ) -> BundleVerification:
     receipt = _load_object(root / "portable-receipt.json")
     manifest = _load_object(root / "portable-proof-manifest.json")
-    requirements = _manifest_path_map(root, manifest)
+    requirements = _manifest_path_map(manifest, root=root)
     requirements["R-18"] = list(crash_paths)
     requirements["R-19"] = list(benchmark_paths)
     requirements["R-20"] = [ledger_path, *_regular_tree_files(qualification_root)]
@@ -740,7 +740,11 @@ def _register_attestation_receipt(
     )
 
 
-def _manifest_path_map(root: Path, manifest: Mapping[str, Any]) -> dict[str, list[Path]]:
+def _manifest_path_map(
+    manifest: Mapping[str, Any],
+    *,
+    root: Path | None = None,
+) -> dict[str, list[Path]]:
     requirements = manifest.get("requirements")
     if not isinstance(requirements, Mapping):
         raise IntegrityError("proof manifest requirements are missing")
@@ -753,10 +757,15 @@ def _manifest_path_map(root: Path, manifest: Mapping[str, Any]) -> dict[str, lis
             if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str):
                 raise IntegrityError("proof manifest entry is malformed")
             relative = Path(str(entry["path"]))
-            resolved = (root / relative).resolve()
-            if relative.is_absolute() or (resolved != root and root not in resolved.parents):
-                raise IntegrityError("proof manifest path escapes its artifact root")
-            paths.append(resolved)
+            if root is None:
+                paths.append(relative)
+            else:
+                resolved = (root / relative).resolve()
+                if relative.is_absolute() or (
+                    resolved != root and root not in resolved.parents
+                ):
+                    raise IntegrityError("proof manifest path escapes its artifact root")
+                paths.append(resolved)
         result[requirement_id] = paths
     return result
 
