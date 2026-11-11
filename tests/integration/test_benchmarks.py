@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from pathlib import Path
+from time import perf_counter, sleep
 
 import pytest
 
+from tars_revoke.demo import benchmarks
 from tars_revoke.demo.benchmarks import (
     BENCHMARK_OPERATIONS,
     PRODUCER_PROTOCOL,
@@ -25,7 +27,44 @@ from tars_revoke.persistence.store import Store
 
 
 @pytest.mark.slow
-async def test_revoke_bench_executes_twenty_persisted_race_schedules(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "inject_latency_regression", [False, True], ids=["real-timing", "slow-worker"]
+)
+async def test_revoke_bench_executes_twenty_persisted_race_schedules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_latency_regression: bool,
+) -> None:
+    if inject_latency_regression:
+        original_complete = benchmarks._complete_unrelated
+        baseline_ms = 0.0
+
+        def slower_concurrent_completion(
+            fixture: benchmarks._TrialFixture,
+            *,
+            action_id: str,
+            effect_id: str,
+            token: str,
+        ) -> float:
+            nonlocal baseline_ms
+            started = perf_counter()
+            measured_ms = original_complete(
+                fixture,
+                action_id=action_id,
+                effect_id=effect_id,
+                token=token,
+            )
+            if action_id == fixture.unrelated_baseline_action_id:
+                baseline_ms = measured_ms
+                return measured_ms
+            # Fault injection only: delay actual work by three times its paired
+            # baseline and include that wall time in the recorded observation.
+            # Production measurement and release thresholds remain unchanged.
+            sleep(max(0.1, baseline_ms * 3 / 1_000))
+            return (perf_counter() - started) * 1_000
+
+        monkeypatch.setattr(benchmarks, "_complete_unrelated", slower_concurrent_completion)
+
     report = dict(await run_benchmark_suite(tmp_path))
 
     assert report["suite"] == "RevokeBench-20"
@@ -59,6 +98,9 @@ async def test_revoke_bench_executes_twenty_persisted_race_schedules(tmp_path: P
     latency_target = targets["unrelated_task_p95_added_latency"]
     assert latency_target["passed"] == (latency_target["actual"] < latency_target["target"])
     assert report["passed"] == all(target["passed"] for target in targets.values())
+    if inject_latency_regression:
+        assert not latency_target["passed"]
+        assert not report["passed"]
     submission_orders = {trial["submission_order"] for trial in report["trials"]}
     assert len(submission_orders) >= 4
     assert len({trial["schedule_seed"] for trial in report["trials"]}) == 20
@@ -95,9 +137,10 @@ async def test_revoke_bench_executes_twenty_persisted_race_schedules(tmp_path: P
         assert [worker["operation"] for worker in trace["workers"]] == list(expected_order)
         assert {worker["submission_ordinal"] for worker in trace["workers"]} == {0, 1, 2}
         assert {worker["barrier_ordinal"] for worker in trace["workers"]} == {0, 1, 2}
-        assert len(
-            {(worker["thread_name"], worker["thread_ident"]) for worker in trace["workers"]}
-        ) == 3
+        assert (
+            len({(worker["thread_name"], worker["thread_ident"]) for worker in trace["workers"]})
+            == 3
+        )
         for worker in trace["workers"]:
             assert (
                 0
@@ -138,9 +181,7 @@ async def test_revoke_bench_executes_twenty_persisted_race_schedules(tmp_path: P
             worker for worker in trace["workers"] if worker["operation"] == "dispatch"
         )
         dispatch_outcome = dispatch_worker["outcome"]
-        assert (dispatch_outcome["status"] == "DISPATCHED") == trial[
-            "dispatch_succeeded"
-        ]
+        assert (dispatch_outcome["status"] == "DISPATCHED") == trial["dispatch_succeeded"]
         assert dispatch_outcome["durable"]["observed_final_state"] == "REVOKE_PENDING"
         assert dispatch_outcome["durable"]["effect_observed_final_state"] == "REVOKE_PENDING"
         assert bool(trial["dispatch_sequences"]) == trial["dispatch_succeeded"]
@@ -163,7 +204,13 @@ async def test_revoke_bench_executes_twenty_persisted_race_schedules(tmp_path: P
             ]
         },
     }
-    assert verify_revokebench(tmp_path, manifest).valid
+    # Shared-runner timing is not a guaranteed passing release qualification.
+    # The verifier must accept only reports that really passed every target.
+    if report["passed"]:
+        assert verify_revokebench(tmp_path, manifest).valid
+    else:
+        with pytest.raises(IntegrityError, match="not a passing 20-trial run"):
+            verify_revokebench(tmp_path, manifest)
     release_root = tmp_path / "portable-release"
     release_root.mkdir()
     copied = _copy_benchmark_evidence(release_root, report_path=report_path)
@@ -180,7 +227,11 @@ async def test_revoke_bench_executes_twenty_persisted_race_schedules(tmp_path: P
             ]
         },
     }
-    assert verify_revokebench(release_root, copied_manifest).valid
+    if report["passed"]:
+        assert verify_revokebench(release_root, copied_manifest).valid
+    else:
+        with pytest.raises(IntegrityError, match="not a passing 20-trial run"):
+            verify_revokebench(release_root, copied_manifest)
 
 
 @pytest.mark.slow

@@ -41,7 +41,7 @@ jobs:
         # sandbox-exec is deprecated and non-functional on GitHub macOS runners
         # (hardened runtime). These 3 tests pass on a real dev Mac.
         run: >-
-          pytest
+          pytest --basetemp=artifacts/pytest
           --deselect tests/unit/test_experiment_sandbox.py::test_allow_only_sandbox_runs_the_bound_python
           --deselect tests/integration/test_canonical_demo.py::test_canonical_demo_proves_selective_revoke_repair_and_resume
           --deselect tests/integration/test_canonical_demo.py::test_portable_and_release_receipts_require_distinct_exact_durable_rows
@@ -64,3 +64,10 @@ jobs:
         with:
           name: tars-revoke-release
           path: dist/
+      - name: Preserve benchmark timing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-test-reports-${{ github.run_id }}
+          path: artifacts/pytest/test_revoke_bench*/revokebench-20-*/report.json
+          if-no-files-found: warn
