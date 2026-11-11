@@ -37,6 +37,8 @@ jobs:
         run: |
           ruff check src tests tools
           mypy src/tars_revoke
+      - name: Prepare test artifact directory
+        run: mkdir -p artifacts
       - name: Python tests
         # sandbox-exec is deprecated and non-functional on GitHub macOS runners
         # (hardened runtime). These 3 tests pass on a real dev Mac.
