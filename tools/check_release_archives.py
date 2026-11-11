@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -33,7 +34,7 @@ def require_suffix(names: set[str], suffix: str) -> None:
 
 
 def main() -> None:
-    dist = Path("dist")
+    dist = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dist")
     sdists = sorted(dist.glob("tars_revoke-*.tar.gz"))
     wheels = sorted(dist.glob("tars_revoke-*.whl"))
     if len(sdists) != 1 or len(wheels) != 1:
@@ -57,6 +58,10 @@ def main() -> None:
     ):
         require_suffix(sdist_names, suffix)
     for suffix in (
+        "tars_revoke/codex_plugin/plugin.json",
+        "tars_revoke/codex_plugin/hooks/hooks.json",
+        "tars_revoke/codex_plugin/scripts/hook.py",
+        "tars_revoke/codex_plugin/skills/tars-revoke/SKILL.md",
         "tars_revoke/persistence/schema.sql",
         "tars_revoke/demo/fixture_template/scripts/contract_probe.py",
         "tars_revoke/web_dist/index.html",

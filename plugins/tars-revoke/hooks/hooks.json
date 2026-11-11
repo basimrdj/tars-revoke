@@ -1,0 +1,66 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking TARS requirements",
+            "additionalContextLimit": 800
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking TARS requirements",
+            "additionalContextLimit": 800
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking TARS requirements"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking TARS requirements"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/hook.py\"",
+            "timeout": 150,
+            "statusMessage": "Checking TARS requirements"
+          }
+        ]
+      }
+    ]
+  }
+}

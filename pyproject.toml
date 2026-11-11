@@ -4,16 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tars-revoke"
-version = "0.1.0"
+version = "0.2.0a1"
 description = "Continuous, evidence-backed authorization for coding agents"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Basim Hussain" }]
 dependencies = [
-  "cryptography>=48.0.1,<49",
+  "cryptography>=50.0.2,<51",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
+  "certifi>=2026.10.18",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "rich>=13.9,<15",
@@ -23,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "build>=1.5,<2",
+  "build>=1.6.1,<2",
   "hypothesis>=6.124,<7",
   "mypy>=1.14,<2",
   "pip-audit>=2.10,<3",
@@ -43,6 +44,7 @@ packages = ["src/tars_revoke"]
 "src/tars_revoke/persistence/schema.sql" = "tars_revoke/persistence/schema.sql"
 "demo/billing-repo" = "tars_revoke/demo/fixture_template"
 "web/dist" = "tars_revoke/web_dist"
+"plugins/tars-revoke" = "tars_revoke/codex_plugin"
 
 [tool.hatch.build]
 ignore-vcs = true
@@ -52,6 +54,9 @@ only-include = [
   "src",
   "demo/billing-repo",
   "docs/revoke",
+  "docs/codex",
+  "plugins",
+  ".agents/plugins",
   "tests",
   "tools",
   "web",

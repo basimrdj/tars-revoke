@@ -119,7 +119,7 @@ class ScriptedCodex:
     provider = "scripted-codex-demo-double"
 
     def __init__(self, *, python_executable: Path) -> None:
-        self.python_executable = python_executable.expanduser().resolve(strict=True)
+        self.python_executable = python_executable.expanduser().absolute()
 
     def initial_uuid_change(self, worktree: Path) -> tuple[str, ...]:
         model = self._bounded_path(worktree, "billing/models.py")

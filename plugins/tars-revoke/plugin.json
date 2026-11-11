@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "tars-revoke",
+  "version": "0.2.0-alpha.1",
+  "description": "Automatic local requirements checks and durable tool observations for Codex. Developer preview; cooperative protection.",
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/hooks.json"
+    }
+  }
+}

@@ -78,7 +78,11 @@ from .concurrency import (
     verify_concurrent_codex_proof,
 )
 from .experiment_contract import HYPOTHESES, matching_hypotheses
-from .experiment_sandbox import build_experiment_sandbox, workspace_manifest
+from .experiment_sandbox import (
+    bound_experiment_python,
+    build_experiment_sandbox,
+    workspace_manifest,
+)
 from .fixture import DemoFixture, FixtureBuilder
 from .live_codex import (
     ContradictionAnalysis,
@@ -125,7 +129,7 @@ def _resolve_experiment_argv(
 
     if not argv or not is_python_executable(argv[0]):
         raise IntegrityError("decisive experiments must use the bounded Python runtime")
-    executable = python_executable.expanduser().resolve(strict=True)
+    executable = bound_experiment_python(python_executable)
     if not executable.is_file():
         raise IntegrityError("decisive experiment Python runtime is not a regular file")
     return (str(executable), *argv[1:])
@@ -179,7 +183,7 @@ class CanonicalScenario:
         self.fixture = fixture
         self.store = store
         self.artifact_root = fixture.artifacts_root
-        self.python_executable = python_executable.expanduser().resolve(strict=True)
+        self.python_executable = python_executable.expanduser().absolute()
         self.scripted_codex = scripted_codex
         self.live_codex = live_codex_path
         self.runner = AsyncProcessRunner([fixture.root])
@@ -221,7 +225,7 @@ class CanonicalScenario:
         codex_bin: Path | None = None,
         codex_timeout_seconds: float = 900.0,
     ) -> CanonicalScenario:
-        executable = (python_executable or Path(sys.executable)).expanduser().resolve(strict=True)
+        executable = (python_executable or Path(sys.executable)).expanduser().absolute()
         identifier = run_id or new_id("run")
         fixture = await FixtureBuilder(
             output_root,
