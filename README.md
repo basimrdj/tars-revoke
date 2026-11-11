@@ -18,6 +18,23 @@ authorization lineage.
 > allowed five minutes ago, but its justification just became false—revoke and
 > recover.”
 
+## Codex integration preview
+
+The `0.2.0a1` preview adds automatic local Codex hooks: session tracking,
+requirements-change detection, stale-call denial, restricted local repair, and
+independently executed tests before accepting a fresh baseline. Developers can
+use it on their own repositories without registering each command manually.
+
+Install a built preview wheel, then run `tars-revoke codex setup` in your project
+and review the hooks in Codex. See the [Codex setup and recovery guide](docs/codex/README.md).
+The supported onboarding path has been exercised with a real Codex CLI session.
+
+This preview is cooperative local protection. Its qualification is separate
+from the original canonical release below. General remote enforcement,
+automatic compensation outside the isolated scenario, and the complete
+production gate remain outstanding. Hook-bearing plugins currently require
+manual/GitHub distribution rather than public-directory submission.
+
 ## The canonical proof
 
 The included scenario is a real isolated software system, not a narrated UI:
@@ -74,7 +91,7 @@ clearly labelled and does not count as live-Codex evidence.
 
 ### Source checkout
 
-Requirements: macOS, Python 3.10+, Git, Node.js/npm, `uv`, and the Codex CLI
+Requirements: macOS, Python 3.11+, Git, Node.js/npm, `uv`, and the Codex CLI
 for live mode.
 Release qualification additionally requires the pinned OpenAI desktop Codex
 binary from `ChatGPT.app` (or legacy `Codex.app`), with exact release bytes,
@@ -278,7 +295,7 @@ protocol replay. It is labelled `SCRIPTED` and does not satisfy live Codex
 requirements. It exists so anyone can inspect the full revocation protocol
 without spending credits.
 
-## Release status
+## Historical canonical release status (v0.1.0)
 
 | Metric | Result |
 |--------|--------|
@@ -288,7 +305,8 @@ without spending credits.
 | Live evidence commit | `8c58251` |
 | Final validated code release | `e58b741` |
 
-Commits after `e58b741` do not modify the validated application source; they update documentation and CI configuration. The live evidence is bound to
+The table above records the v0.1.0 release. The later Codex integration preview
+changes application source and is not covered by that historical attestation. The live evidence is bound to
 `8c58251`; the two subsequent code commits (`cb18c6c`, `e58b741`) fix offline
 portable-attestation packaging exposed by those real proofs. The final
 attestation validates successfully against the complete release.

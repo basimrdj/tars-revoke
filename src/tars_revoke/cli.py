@@ -18,6 +18,7 @@ from rich.table import Table
 from tars_revoke.adapters.codex import CodexCLIAdapter
 from tars_revoke.adapters.processes import AsyncProcessRunner
 from tars_revoke.api.schemas import DoctorCheck, DoctorReport
+from tars_revoke.codex_hook_cli import app as codex_app
 from tars_revoke.config import Settings, load_settings
 from tars_revoke.demo.verifier import find_artifact_root, verify_bundle
 
@@ -27,6 +28,9 @@ app = typer.Typer(
     no_args_is_help=True,
     pretty_exceptions_show_locals=False,
 )
+
+app.add_typer(codex_app, name="codex")
+
 console = Console()
 ResultT = TypeVar("ResultT")
 
@@ -55,7 +59,7 @@ async def _doctor_report(settings: Settings) -> DoctorReport:
     checks.append(
         DoctorCheck(
             name="sqlite",
-            ok=sqlite3.sqlite_version_info >= (3, 35),
+            ok=sqlite3.sqlite_version_info >= (3, 37),
             detail=sqlite3.sqlite_version,
         )
     )

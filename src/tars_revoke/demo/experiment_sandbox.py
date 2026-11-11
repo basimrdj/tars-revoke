@@ -155,6 +155,28 @@ class ExperimentSandboxPlan:
         }
 
 
+def bound_experiment_python(invocation: Path) -> Path:
+    """Use the same interpreter bytes directly for stdlib-only observers.
+
+    Virtualenv copies of relocatable Python builds cannot discover their stdlib
+    under a narrow Seatbelt profile. The registered base executable has the
+    identical bytes and a discoverable stdlib next to it. This does not permit
+    an arbitrary executable or expand the filesystem/network policy.
+    """
+    candidate = invocation.expanduser()
+    if not candidate.is_absolute():
+        raise IntegrityError("experiment Python invocation must be absolute")
+    resolved = candidate.resolve(strict=True)
+    current = Path(sys.executable).resolve(strict=True)
+    base = Path(getattr(sys, "_base_executable", sys.executable)).resolve(strict=True)
+    current_digest = sha256_digest(current.read_bytes())
+    if resolved not in {current, base} or sha256_digest(resolved.read_bytes()) != current_digest:
+        raise IntegrityError("experiment Python differs from the running TARS runtime")
+    if base.is_file() and sha256_digest(base.read_bytes()) == current_digest:
+        return base
+    return candidate
+
+
 def build_experiment_sandbox(
     *,
     logical_argv: tuple[str, ...],
@@ -172,12 +194,13 @@ def build_experiment_sandbox(
         raise IntegrityError("experiment worktree is missing or unsafe")
     if not logical_argv:
         raise IntegrityError("experiment logical argv is empty")
-    python_invocation = Path(logical_argv[0]).expanduser()
+    python_invocation = bound_experiment_python(Path(logical_argv[0]))
+    logical_argv = (str(python_invocation), *logical_argv[1:])
     if not python_invocation.is_absolute() or not python_invocation.is_file():
         raise IntegrityError("experiment Python invocation path is invalid")
     python_resolved = python_invocation.resolve(strict=True)
     current_python = Path(sys.executable).expanduser().resolve(strict=True)
-    if python_resolved != current_python:
+    if sha256_digest(python_resolved.read_bytes()) != sha256_digest(current_python.read_bytes()):
         raise IntegrityError("experiment Python differs from the running TARS runtime")
 
     allowed_paths = tuple(

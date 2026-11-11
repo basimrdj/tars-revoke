@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
           cache: pip
       - uses: actions/setup-node@v4
         with:
@@ -37,11 +37,13 @@ jobs:
         run: |
           ruff check src tests tools
           mypy src/tars_revoke
+      - name: Prepare test artifact directory
+        run: mkdir -p artifacts
       - name: Python tests
         # sandbox-exec is deprecated and non-functional on GitHub macOS runners
         # (hardened runtime). These 3 tests pass on a real dev Mac.
         run: >-
-          pytest
+          pytest --basetemp=artifacts/pytest
           --deselect tests/unit/test_experiment_sandbox.py::test_allow_only_sandbox_runs_the_bound_python
           --deselect tests/integration/test_canonical_demo.py::test_canonical_demo_proves_selective_revoke_repair_and_resume
           --deselect tests/integration/test_canonical_demo.py::test_portable_and_release_receipts_require_distinct_exact_durable_rows
@@ -57,3 +59,17 @@ jobs:
         run: |
           python -m build
           python tools/check_release_archives.py
+      - name: Smoke test installed Codex integration wheel
+        run: python tools/smoke_codex_wheel.py dist/*.whl
+      - name: Upload reviewable release archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: tars-revoke-release
+          path: dist/
+      - name: Preserve benchmark timing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-test-reports-${{ github.run_id }}
+          path: artifacts/pytest/test_revoke_bench*/revokebench-20-*/report.json
+          if-no-files-found: warn
